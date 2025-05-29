@@ -6,3 +6,4 @@ deep-translator
 oauth2client
 gspread
 gunicorn
+openai
