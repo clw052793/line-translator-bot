@@ -1,0 +1,8 @@
+flask
+line-bot-sdk
+python-dotenv
+langdetect
+deep-translator
+oauth2client
+gspread
+gunicorn

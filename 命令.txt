@@ -1,0 +1,6 @@
+cd C:\Windows\System32\line-translator-bot
+.\venv\Scripts\activate
+python main.py
+
+ngork
+ngrok http 5000
