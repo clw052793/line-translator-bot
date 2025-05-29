@@ -10,13 +10,11 @@ from linebot.models import TextMessage, MessageEvent
 from deep_translator import GoogleTranslator
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import openai
+
 
 # --- Load .env ---
 load_dotenv()
 
-# --- API Keys ---
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # --- Flask Setup ---
 app = Flask(__name__)
@@ -329,19 +327,6 @@ def detect_language(text):
     except LangDetectException:
         return None, text
 
-def gpt_polish(text):
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "system", "content": "你是一位語言專家，請將翻譯後的句子潤飾得自然流暢。"},
-                      {"role": "user", "content": text}],
-            temperature=0.7,
-            max_tokens=100
-        )
-        return response['choices'][0]['message']['content'].strip()
-    except Exception as e:
-        print("GPT潤飾錯誤：", e)
-        return text
 
 def preprocess_text(text, lang):
     if lang == 'indonesian':
