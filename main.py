@@ -361,7 +361,7 @@ def process_message(text):
     else:
         return "⚠️ 僅支援中文與印尼文"
 
-    translated = gpt_polish(translated)
+
     save_to_sheet(text, translated)
     return translated
 
