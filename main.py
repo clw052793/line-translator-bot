@@ -372,6 +372,10 @@ def callback():
     body = request.get_data(as_text=True)
     handler.handle(body, signature)
     return 'OK'
+    
+@app.route("/ping")
+def ping():
+    return "pong", 200
 
 @handler.add(MessageEvent)
 def handle_message(event):
