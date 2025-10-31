@@ -359,6 +359,7 @@ chinese_indonesian_vocab = {
 chinese_polish_map = {
     "謝謝你": "謝謝。",
     "好的": "好。",
+    "是啊姐姐":"好的姐姐。",
     "ok": "好。"
 }
 
