@@ -4,65 +4,76 @@ import re
 import json
 import string
 import logging
+import time
+from functools import lru_cache, wraps
 from io import StringIO
 from dotenv import load_dotenv
 
-from flask import Flask, request
+from flask import Flask, request, jsonify, abort
 from langdetect import detect, DetectorFactory
 from langdetect.lang_detect_exception import LangDetectException
 
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import TextMessage, MessageEvent
+from linebot import LineBotApi, WebhookHandler, WebhookParser
+from linebot.models import TextMessage, MessageEvent, TextSendMessage
 
 from deep_translator import GoogleTranslator
 
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+# Optional Google Sheets
+try:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+    GS_AVAILABLE = True
+except Exception:
+    GS_AVAILABLE = False
 
 # --- Load .env ---
 load_dotenv()
 
 # --- Logging ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("line-translator")
 
-# --- Flask & LINE Setup ---
+# --- Flask app ---
 app = Flask(__name__)
+
+# --- LINE setup ---
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    logger.warning("LINE channel token/secret not set. Make sure LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET are set in .env")
+    logger.warning("LINE token/secret not set. Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET in env.")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
+parser = WebhookParser(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 
-# --- Langdetect seed for determinism ---
+# --- langdetect deterministic seed ---
 DetectorFactory.seed = 0
 
-# --- Google Sheets Setup (supports JSON content or file path) ---
+# --- Google Sheets (optional) ---
 sheet = None
-GOOGLE_SHEET_KEY = os.getenv("GOOGLE_SHEET_KEY")
-GOOGLE_SHEET_JSON = os.getenv("GOOGLE_SHEET_JSON")
-
-if GOOGLE_SHEET_KEY and GOOGLE_SHEET_JSON:
+GS_KEY = os.getenv("GOOGLE_SHEET_KEY")
+GS_JSON = os.getenv("GOOGLE_SHEET_JSON")
+if GS_AVAILABLE and GS_KEY and GS_JSON:
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     try:
         try:
-            # first try parse as JSON content
-            creds_data = json.loads(GOOGLE_SHEET_JSON)
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_data, scope)
-            logger.info("Loaded Google credentials from JSON content in env.")
-        except json.JSONDecodeError:
-            # fallback to treat as file path
-            creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_SHEET_JSON, scope)
-            logger.info("Loaded Google credentials from file path.")
+            creds_dict = json.loads(GS_JSON)
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            logger.info("Loaded Google credentials from JSON content.")
+        except Exception:
+            creds = ServiceAccountCredentials.from_json_keyfile_name(GS_JSON, scope)
+            logger.info("Loaded Google credentials from file.")
         gc = gspread.authorize(creds)
-        sheet = gc.open_by_key(GOOGLE_SHEET_KEY).sheet1
-        logger.info("✅ Google Sheets connected.")
+        sheet = gc.open_by_key(GS_KEY).sheet1
+        logger.info("Google Sheets connected.")
     except Exception as e:
-        logger.exception("Failed to initialize Google Sheets: %s", e)
+        logger.exception("Google Sheets init failed: %s", e)
+else:
+    if not GS_AVAILABLE:
+        logger.info("gspread/oauth2client not available; skipping Google Sheets init.")
 
-# --- DICTIONARIES (you provided these; included here) ---
+# --- Dictionaries (kept from your original) ---
+# (for brevity, only show a small subset here; in production paste full map)
 indonesian_abbreviation_map = {
     # 👨‍👩‍👧‍👦 人稱與稱謂
     "ad": "弟弟",
@@ -362,203 +373,245 @@ chinese_polish_map = {
     "是啊姐姐":"好的姐姐。",
     "ok": "好。"
 }
-
 # --- Utility functions ---
-
-def save_to_sheet(original, translated):
-    if sheet:
+def save_to_sheet_row(original, translated, metadata=None):
+    """Append to Google Sheet with retry (synchronous)."""
+    if not sheet:
+        return False
+    row = [time.strftime("%Y-%m-%d %H:%M:%S"), original, translated, json.dumps(metadata or {})]
+    for attempt in range(2):
         try:
-            sheet.append_row([original, translated])
+            sheet.append_row(row)
+            return True
         except Exception as e:
-            logger.exception("Error writing to Google Sheets: %s", e)
+            logger.exception("Write to sheet failed (attempt %d): %s", attempt+1, e)
+            time.sleep(0.5)
+    return False
 
 def expand_abbreviations(text: str) -> str:
-    # 先做 word-boundary 取代（忽略大小寫）
-    # 為避免將 longer tokens 被 shorter tokens 擋掉，排序長度遞減替換
+    # replace whole-word tokens, longer keys first
     keys_sorted = sorted(indonesian_abbreviation_map.keys(), key=lambda k: -len(k))
-    for abbr in keys_sorted:
-        full = indonesian_abbreviation_map[abbr]
-        text = re.sub(r'\b' + re.escape(abbr) + r'\b', full, text, flags=re.IGNORECASE)
-    return text
+    def repl(match):
+        token = match.group(0)
+        lower = token.lower()
+        return indonesian_abbreviation_map.get(lower, token)
+    # word boundary for a token may include punctuation; use regex tokenization
+    pattern = re.compile(r'\b(' + '|'.join(re.escape(k) for k in keys_sorted) + r')\b', flags=re.IGNORECASE)
+    return pattern.sub(lambda m: indonesian_abbreviation_map.get(m.group(0).lower(), m.group(0)), text)
 
 def polish_chinese(text: str) -> str:
     for k, v in chinese_polish_map.items():
         text = text.replace(k, v)
-    if not re.search(r'[。！？]$', text):
+    if not re.search(r'[。！？]$', text.strip()):
         text = text.strip() + "。"
     return text
 
 def detect_language(text: str):
-    # 用中文字元與拉丁字元比例來優先判斷
-    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-    latin_chars = sum(1 for c in text if c.isalpha() and c.lower() in string.ascii_lowercase)
-    logger.debug("chinese_chars=%d latin_chars=%d", chinese_chars, latin_chars)
-
-    if chinese_chars > latin_chars:
+    # quick heuristics: chinese chars vs obvious id tokens
+    if re.search(r'[\u4e00-\u9fff]', text):
         return 'chinese', text
-    elif latin_chars > chinese_chars:
+    if re.search(r'\b(saya|aku|makan|tidur|pagi|selamat|terima kasih|kamu|kmu|mkn|udh)\b', text.lower()):
         return 'indonesian', text
-    else:
-        # fallback to langdetect
-        try:
-            detected = detect(text)
-            return detected, text
-        except LangDetectException:
-            return None, text
+    try:
+        detected = detect(text)
+        return detected, text
+    except LangDetectException:
+        return None, text
 
 def convert_jam_to_hhmm(text: str) -> str:
     """
-    Convert patterns like:
-      - jam 9, jam9, jam 9.5, jam 9:30, jam 12.35
-      - jam 3 sore / jam 6 pagi / jam 7 malam
-    into consistent HH:MM 24-hour format or preserve readable '下午9:00' depending on strategy.
-    We'll output HH:MM (24h) for clarity (e.g., jam 3 sore -> 15:00).
+    Converts 'jam 3 sore', 'jam9', 'jam 9.5', 'jam 9:30' -> HH:MM.
+    Keeps simple heuristics for 'pagi/siang/sore/malam'.
     """
-    def hour_min_to_24(hour_int: int, minute_int: int, period: str = None):
-        # period could be 'pagi', 'siang', 'sore', 'malam', 'a.m.', 'p.m.' etc.
+    def to_24(h, m, period):
+        h = int(h) % 24
+        m = int(m)
         if period:
             p = period.lower()
-            if p in ('sore', 'malam', 'p.m.', 'pm'):
-                if hour_int < 12:
-                    hour_int = hour_int + 12
-            if p in ('pagi', 'a.m.', 'am'):
-                if hour_int == 12:
-                    hour_int = 0
-            # 'siang'一般視為12:00-15:00，保持原本數字（若需要進一步處理可擴充）
-        # bound hour
-        hour_int = hour_int % 24
-        return f"{hour_int:02d}:{minute_int:02d}"
+            if p in ('sore', 'malam', 'pm', 'p.m.'):
+                if h < 12:
+                    h += 12
+            if p in ('pagi','am','a.m.') and h == 12:
+                h = 0
+        return f"{h:02d}:{m:02d}"
 
-    # 先處理帶 period 的形式： jam 3 sore / jam 3 pagi
-    pattern_period = re.compile(r'\bjam\s*(\d{1,2})(?:[:.,]\s*(\d{1,2}|\d{1,2}\.\d+))?\s*(pagi|siang|sore|malam|a\.m\.|p\.m\.|am|pm)\b', flags=re.IGNORECASE)
+    # jam 3 sore
+    pattern_period = re.compile(r'\bjam\s*(\d{1,2})(?:[:.,](\d{1,2}|\d*\.\d+))?\s*(pagi|siang|sore|malam|am|pm|a\.m\.|p\.m\.)\b', flags=re.IGNORECASE)
     def repl_period(m):
         h = int(m.group(1))
-        min_part = m.group(2)
+        minpart = m.group(2)
         period = m.group(3)
         minute = 0
-        if min_part:
-            if '.' in min_part:
-                try:
-                    minute = round(float("0." + min_part.split('.')[-1]) * 60)
-                except:
-                    minute = int(float(min_part))
+        if minpart:
+            if '.' in minpart:
+                minute = int(round(float(minpart) * 60))
             else:
-                minute = int(min_part)
-        return hour_min_to_24(h, minute, period)
+                minute = int(minpart)
+        return to_24(h, minute, period)
     text = pattern_period.sub(repl_period, text)
 
-    # 處理含小數的 like jam 9.5 or jam 9.25 (9.5 -> 9:30)
-    pattern_decimal = re.compile(r'\bjam\s*(\d{1,2})\s*[:.,]?\s*(\d*\.\d+)\b', flags=re.IGNORECASE)
+    # jam 9.5 or jam 9.25
+    pattern_decimal = re.compile(r'\bjam\s*(\d{1,2})\s*[.,]?\s*(\d*\.\d+)\b', flags=re.IGNORECASE)
     def repl_decimal(m):
         h = int(m.group(1))
         dec = float(m.group(2))
         minute = int(round(dec * 60))
-        return hour_min_to_24(h, minute)
+        return to_24(h, minute, None)
     text = pattern_decimal.sub(repl_decimal, text)
 
-    # 處理標準 jam H[:MM]
-    pattern_basic = re.compile(r'\bjam\s*(\d{1,2})(?:[:.,]\s*(\d{1,2}))?\b', flags=re.IGNORECASE)
+    # jam 9:30 or jam9 or jam 9
+    pattern_basic = re.compile(r'\bjam\s*(\d{1,2})(?:[:.,](\d{1,2}))?\b', flags=re.IGNORECASE)
     def repl_basic(m):
         h = int(m.group(1))
-        min_part = m.group(2)
-        minute = int(min_part) if min_part and min_part.isdigit() else 0
-        return hour_min_to_24(h, minute)
+        minute = int(m.group(2)) if m.group(2) and m.group(2).isdigit() else 0
+        return to_24(h, minute, None)
     text = pattern_basic.sub(repl_basic, text)
-
     return text
 
 def preprocess_text(text: str, lang: str) -> str:
     if lang == 'indonesian':
-        # expand some chinese-style time like "12點30" -> "12:30" if present in imported text
         text = re.sub(r'(\d{1,2})點(\d{1,2})', r'\1:\2', text)
-        text = re.sub(r'(\d{1,2})點', r'\1:00', text)
-        # normalize "jam ..." to HH:MM 24h
+        text = re.sub(r'(\d{1,2})點\b', r'\1:00', text)
         text = convert_jam_to_hhmm(text)
+        text = expand_abbreviations(text)
     return text
 
-def translate_text(text: str, source: str, target: str) -> str:
+# --- Translator singletons & cache ---
+translator_id_zh = GoogleTranslator(source="id", target="zh-TW")
+translator_zh_id = GoogleTranslator(source="zh-TW", target="id")
+
+@lru_cache(maxsize=2048)
+def translate_cached(source, target, text):
+    """Cache by exact parameters (source,target,text)."""
     try:
+        if source.startswith('id'):
+            return translator_id_zh.translate(text)
+        if source.startswith('zh'):
+            return translator_zh_id.translate(text)
+        # fallback
         return GoogleTranslator(source=source, target=target).translate(text)
     except Exception as e:
-        logger.exception("Translation error: %s", e)
+        logger.exception("Translation engine error: %s", e)
         return "⚠️ 翻譯失敗"
 
-# --- Main processing pipeline ---
+# --- Simple rate limiter (in-memory) ---
+RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))  # messages per minute per token/ip
+_rate_store = {}  # key -> [count, window_start_ts]
 
-def process_message(text: str) -> str:
+def rate_limited(key):
+    now = int(time.time())
+    window = 60
+    record = _rate_store.get(key, [0, now])
+    count, start = record
+    if now - start >= window:
+        # reset
+        record = [0, now]
+        count, start = record
+    if count >= RATE_LIMIT:
+        return True
+    record[0] += 1
+    _rate_store[key] = record
+    return False
+
+# --- Main processing pipeline ---
+def process_message(text: str, client_key: str = "anonymous") -> dict:
     text = text.strip()
-    if not text or all(ch in string.punctuation for ch in text):
-        return "⚠️ 請輸入有效文字"
+    if not text:
+        return {"error": "請輸入有效文字"}
+
+    if rate_limited(client_key):
+        return {"error": f"速率限制：每 {60} 秒最多 {RATE_LIMIT} 次"}
 
     lang, cleaned = detect_language(text)
-    logger.info("Detected language: %s | Text: %s", lang, cleaned)
+    logger.info("process_message: detected=%s text=%s", lang, cleaned)
 
     if not lang:
-        return "⚠️ 無法偵測語言"
+        return {"error": "無法偵測語言"}
 
-    # handle Indonesian input
     if lang == 'indonesian' or lang.startswith('id'):
-        # expand abbreviations then preprocess (time convert etc)
-        expanded = expand_abbreviations(cleaned.lower())
-        preprocessed = preprocess_text(expanded, 'indonesian')
-        translated = translate_text(preprocessed, source='id', target='zh-TW')
-        polished = polish_chinese(translated)
-        save_to_sheet(text, polished)
-        return f"🗣️ 翻譯結果：{polished}"
-
-    # handle Chinese input
+        expanded = expand_abbreviations(cleaned)
+        pre = preprocess_text(expanded, 'indonesian')
+        tr = translate_cached('id', 'zh-TW', pre)
+        polished = polish_chinese(tr)
+        save_to_sheet_row(text, polished, metadata={"direction":"id->zh", "client": client_key})
+        return {"result": polished, "original_expanded": expanded, "preprocessed": pre, "lang": "id"}
     elif lang == 'chinese' or lang.startswith('zh'):
-        # polish Chinese then translate to Indonesian
-        polished_input = polish_chinese(cleaned)
-        # optionally translate dictionary replacements first for short phrases (we keep general translate)
-        translated = translate_text(polished_input, source='zh-TW', target='id')
-        save_to_sheet(text, translated)
-        return f"🗣️ 翻譯結果：{translated}"
-
-    # fallback: if langdetect gives 'en' or others, try translate to both?
+        polished_in = polish_chinese(cleaned)
+        tr = translate_cached('zh-TW', 'id', polished_in)
+        save_to_sheet_row(text, tr, metadata={"direction":"zh->id", "client": client_key})
+        return {"result": tr, "polished_input": polished_in, "lang": "zh"}
     else:
-        # we'll only handle chinese and indonesian explicitly
-        return "⚠️ 僅支援中文與印尼文"
+        return {"error": "僅支援中文與印尼文"}
 
-# --- LINE Webhook handlers ---
-@app.route("/callback", methods=["POST"])
-def callback():
-    # signature may not exist in testing env
-    signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True)
-    if handler:
-        try:
-            handler.handle(body, signature)
-        except Exception as e:
-            logger.exception("Error handling LINE webhook: %s", e)
-            # Don't disclose internals to LINE
-    else:
-        logger.warning("LINE handler not configured.")
-    return "OK", 200
-
+# --- Flask endpoints ---
 @app.route("/ping", methods=["GET"])
 def ping():
     return "pong", 200
 
+@app.route("/health", methods=["GET"])
+def health():
+    ok = {"ok": True, "sheets": bool(sheet)}
+    return jsonify(ok), 200
+
+@app.route("/translate", methods=["POST"])
+def translate_api():
+    data = request.get_json(force=True)
+    text = data.get("text", "")
+    client = data.get("client", request.remote_addr or "anonymous")
+    res = process_message(text, client_key=client)
+    return jsonify(res), 200 if "result" in res else 400
+
+@app.route("/history", methods=["GET"])
+def history():
+    # basic: if Google Sheet configured, return last N rows (limited)
+    if not sheet:
+        return jsonify({"error": "Google Sheets 未配置"}), 400
+    n = int(request.args.get("n", 20))
+    try:
+        rows = sheet.get_all_values()[-n:]
+        return jsonify({"rows": rows}), 200
+    except Exception as e:
+        logger.exception("Failed to fetch sheet rows: %s", e)
+        return jsonify({"error": "無法讀取試算表"}), 500
+
+@app.route("/callback", methods=["POST"])
+def callback():
+    # LINE signature validated by parser/handler
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
+    if not handler or not line_bot_api:
+        logger.warning("LINE not configured; ignoring callback.")
+        return "LINE not configured", 503
+    try:
+        handler.handle(body, signature)
+    except Exception as e:
+        logger.exception("LINE webhook handle error: %s", e)
+        return "OK", 200
+    return "OK", 200
+
 if handler:
-    @handler.add(MessageEvent)
+    @handler.add(MessageEvent, message=TextMessage)
     def handle_message(event):
         try:
-            # only care text messages
-            from linebot.models import TextMessage as LineTextMessage
-            if isinstance(event.message, LineTextMessage):
-                user_message = event.message.text
-                reply = process_message(user_message)
-                if line_bot_api:
-                    line_bot_api.reply_message(event.reply_token, TextMessage(text=reply))
-                else:
-                    logger.warning("LINE API not configured; cannot reply.")
+            user_msg = event.message.text
+            user_id = getattr(event.source, "user_id", None) or getattr(event.source, "group_id", None) or "unknown"
+            client_key = f"line:{user_id}"
+            res = process_message(user_msg, client_key=client_key)
+            if "result" in res:
+                reply_text = f"🗣️ 翻譯結果：{res['result']}"
+            else:
+                reply_text = f"⚠️ {res.get('error', '處理失敗')}"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         except Exception as e:
             logger.exception("Error in handle_message: %s", e)
+            try:
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 內部錯誤"))
+            except Exception:
+                pass
 
-# --- Run app ---
+# --- Run ---
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     host = os.getenv("HOST", "0.0.0.0")
-    logger.info("Starting app on %s:%d", host, port)
-    app.run(host=host, port=port)
+    logger.info("Starting Flask app on %s:%d", host, port)
+    app.run(host=host, port=port, debug=os.getenv("FLASK_DEBUG", "0") == "1")
