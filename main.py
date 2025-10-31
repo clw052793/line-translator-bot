@@ -154,7 +154,7 @@ indonesian_abbreviation_map = {
     "krn": "karena",
     "karna": "karena",
     "iya": "ya",
-    "lya": "ya",
+    "lya": "是的",
     "yaudah": "好啦",
     "ywdh": "好啦",
     "ngga": "不",
