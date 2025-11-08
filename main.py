@@ -1,14 +1,12 @@
 import os
 import re
 import json
-import string
 import logging
 import time
-from functools import lru_cache, wraps
-from io import StringIO
+from functools import lru_cache
 from dotenv import load_dotenv
 
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 from langdetect import detect, DetectorFactory
 from langdetect.lang_detect_exception import LangDetectException
 
@@ -45,7 +43,7 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKE
 handler = WebhookHandler(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 parser = WebhookParser(LINE_CHANNEL_SECRET) if LINE_CHANNEL_SECRET else None
 
-# --- langdetect deterministic seed ---
+# --- langdetect deterministic seed (僅用來 log，實際方向我們不用它決定) ---
 DetectorFactory.seed = 0
 
 # --- Google Sheets (optional) ---
@@ -53,7 +51,10 @@ sheet = None
 GS_KEY = os.getenv("GOOGLE_SHEET_KEY")
 GS_JSON = os.getenv("GOOGLE_SHEET_JSON")
 if GS_AVAILABLE and GS_KEY and GS_JSON:
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
     try:
         try:
             creds_dict = json.loads(GS_JSON)
@@ -71,7 +72,7 @@ else:
     if not GS_AVAILABLE:
         logger.info("gspread/oauth2client not available; skipping Google Sheets init.")
 
-# --- Dictionaries (你可以再把原本更完整的 map 貼進來擴充) ---
+# --- Dictionaries (可以自己再擴充) ---
 indonesian_abbreviation_map = {
     # 👨‍👩‍👧‍👦 人稱與稱謂
     "ad": "弟弟",
@@ -80,17 +81,20 @@ indonesian_abbreviation_map = {
     "ce": "姐姐",
     "cece": "姐姐",
     "ibu": "媽媽",
+    "bpk": "先生",
     "ayah": "爸爸",
     "nenek": "奶奶",
+    "kakek": "爺爺",
     "tmn": "朋友",
+    "tm": "他們",
     "sy": "我",
     "aku": "我",
     "saya": "我",
     "kmu": "你",
     "km": "你",
     "anda": "您",
-    "dia": "他/她",
     "dy": "他/她",
+    "dia": "他/她",
 
     # 🕐 時間與日期
     "pagi": "早上",
@@ -101,48 +105,80 @@ indonesian_abbreviation_map = {
     "besok": "明天",
     "kmrn": "昨天",
     "kemarin": "昨天",
+    "td": "剛才",
+    "tdi": "剛才",
+    "nanti": "等一下",
     "udh": "已經",
     "sudah": "已經",
     "blm": "還沒",
     "belum": "還沒",
 
-    # 🍱 生活動作
+    # 🍱 照護與生活動作
     "makan": "吃",
     "mkn": "吃",
     "minum": "喝",
     "mandi": "洗澡",
+    "mandikan": "幫洗澡",
+    "ganti": "換",
     "tidur": "睡覺",
     "bangun": "起床",
+    "temani": "陪",
+    "pulang": "回家",
     "bantu": "幫忙",
+    "rehabilitas": "復健",
     "bersih": "打掃",
     "cuci": "洗",
     "masak": "煮",
+    "masaknya": "煮的",
+    "masukan": "放進",
+    "potong": "切",
     "lihat": "看見",
+    "lihat2": "看看",
+    "pegang": "拿著",
+    "tutup": "關上",
+    "buka": "打開",
 
-    # 💬 聊天縮寫
+    # 💬 聊天口語縮寫
     "aj": "aja",
+    "ajh": "aja",
     "aja": "就好",
     "deh": "就這樣吧",
+    "bwt": "buat",
+    "buat": "為了",
     "jg": "juga",
+    "jgk": "juga",
+    "jga": "juga",
+    "jdi": "jadi",
     "jd": "jadi",
     "kl": "kalau",
+    "klw": "kalau",
     "klo": "kalau",
     "krn": "karena",
+    "karna": "karena",
     "iya": "ya",
+    "lya": "是的",
     "yaudah": "好啦",
+    "ywdh": "好啦",
     "ngga": "不",
     "ga": "不",
     "gk": "不",
+    "nggak": "不",
     "gt": "gitu",
     "gtu": "gitu",
+    "gitu": "那樣",
     "gtw": "不知道",
     "sm": "sama",
+    "sm2": "sama-sama",
     "trs": "terus",
+    "trus": "terus",
+    "sja": "saja",
+    "sllu": "selalu",
     "skrg": "現在",
     "dr": "醫生",
     "dok": "醫生",
     "tp": "tapi",
     "tpi": "tapi",
+    "tapi": "但是",
     "ok": "好",
     "okee": "好喔",
     "okey": "好喔",
@@ -150,7 +186,7 @@ indonesian_abbreviation_map = {
     "mantap": "太棒了",
     "btw": "順便說一下",
 
-    # 其他常見
+    # 🧠 其他補充
     "bkn": "不是",
     "bsa": "bisa",
     "bisa": "可以",
@@ -162,14 +198,6 @@ indonesian_abbreviation_map = {
     "mantul": "很棒",
 }
 
-chinese_indonesian_vocab = {
-    "奶奶": "nenek",
-    "白天": "siang hari",
-    "有": "ada",
-    "排便": "buang air besar",
-}
-
-# 中文潤飾對照（可擴充）
 chinese_polish_map = {
     "謝謝你": "謝謝。",
     "好的": "好。",
@@ -182,33 +210,45 @@ def save_to_sheet_row(original, translated, metadata=None):
     """Append to Google Sheet with retry (synchronous)."""
     if not sheet:
         return False
-    row = [time.strftime("%Y-%m-%d %H:%M:%S"), original, translated, json.dumps(metadata or {})]
+    row = [
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        original,
+        translated,
+        json.dumps(metadata or {}, ensure_ascii=False),
+    ]
     for attempt in range(2):
         try:
             sheet.append_row(row)
             return True
         except Exception as e:
-            logger.exception("Write to sheet failed (attempt %d): %s", attempt + 1, e)
+            logger.exception(
+                "Write to sheet failed (attempt %d): %s", attempt + 1, e
+            )
             time.sleep(0.5)
     return False
 
 
-def expand_abbreviations(text):
-    # replace whole-word tokens, longer keys first
+def expand_abbreviations(text: str) -> str:
     keys_sorted = sorted(indonesian_abbreviation_map.keys(), key=lambda k: -len(k))
-    pattern = re.compile(r'\b(' + '|'.join(re.escape(k) for k in keys_sorted) + r')\b', flags=re.IGNORECASE)
-    return pattern.sub(lambda m: indonesian_abbreviation_map.get(m.group(0).lower(), m.group(0)), text)
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(k) for k in keys_sorted) + r")\b",
+        flags=re.IGNORECASE,
+    )
+    return pattern.sub(
+        lambda m: indonesian_abbreviation_map.get(m.group(0).lower(), m.group(0)),
+        text,
+    )
 
 
-def polish_chinese(text):
+def polish_chinese(text: str) -> str:
     for k, v in chinese_polish_map.items():
         text = text.replace(k, v)
-    if not re.search(r'[。！？]$', text.strip()):
+    if not re.search(r"[。！？]$", text.strip()):
         text = text.strip() + "。"
     return text
 
 
-def convert_jam_to_hhmm(text):
+def convert_jam_to_hhmm(text: str) -> str:
     """
     Converts 'jam 3 sore', 'jam9', 'jam 9.5', 'jam 9:30' -> HH:MM.
     Keeps simple heuristics for 'pagi/siang/sore/malam'.
@@ -219,16 +259,16 @@ def convert_jam_to_hhmm(text):
         m = int(m)
         if period:
             p = period.lower()
-            if p in ('sore', 'malam', 'pm', 'p.m.'):
+            if p in ("sore", "malam", "pm", "p.m."):
                 if h < 12:
                     h += 12
-            if p in ('pagi', 'am', 'a.m.') and h == 12:
+            if p in ("pagi", "am", "a.m.") and h == 12:
                 h = 0
-        return "%02d:%02d" % (h, m)
+        return f"{h:02d}:{m:02d}"
 
     # jam 3 sore
     pattern_period = re.compile(
-        r'\bjam\s*(\d{1,2})(?:[:.,](\d{1,2}|\d*\.\d+))?\s*(pagi|siang|sore|malam|am|pm|a\.m\.|p\.m\.)\b',
+        r"\bjam\s*(\d{1,2})(?:[:.,](\d{1,2}|\d*\.\d+))?\s*(pagi|siang|sore|malam|am|pm|a\.m\.|p\.m\.)\b",
         flags=re.IGNORECASE,
     )
 
@@ -238,7 +278,7 @@ def convert_jam_to_hhmm(text):
         period = m.group(3)
         minute = 0
         if minpart:
-            if '.' in minpart:
+            if "." in minpart:
                 minute = int(round(float(minpart) * 60))
             else:
                 minute = int(minpart)
@@ -247,7 +287,9 @@ def convert_jam_to_hhmm(text):
     text = pattern_period.sub(repl_period, text)
 
     # jam 9.5 or jam 9.25
-    pattern_decimal = re.compile(r'\bjam\s*(\d{1,2})\s*[.,]?\s*(\d*\.\d+)\b', flags=re.IGNORECASE)
+    pattern_decimal = re.compile(
+        r"\bjam\s*(\d{1,2})\s*[.,]?\s*(\d*\.\d+)\b", flags=re.IGNORECASE
+    )
 
     def repl_decimal(m):
         h = int(m.group(1))
@@ -258,7 +300,9 @@ def convert_jam_to_hhmm(text):
     text = pattern_decimal.sub(repl_decimal, text)
 
     # jam 9:30 or jam9 or jam 9
-    pattern_basic = re.compile(r'\bjam\s*(\d{1,2})(?:[:.,](\d{1,2}))?\b', flags=re.IGNORECASE)
+    pattern_basic = re.compile(
+        r"\bjam\s*(\d{1,2})(?:[:.,](\d{1,2}))?\b", flags=re.IGNORECASE
+    )
 
     def repl_basic(m):
         h = int(m.group(1))
@@ -269,144 +313,118 @@ def convert_jam_to_hhmm(text):
     return text
 
 
-def preprocess_text(text, lang):
-    if lang == 'indonesian':
-        text = re.sub(r'(\d{1,2})點(\d{1,2})', r'\1:\2', text)
-        text = re.sub(r'(\d{1,2})點\b', r'\1:00', text)
+def preprocess_text(text: str, lang: str) -> str:
+    if lang == "indonesian":
+        # 中文時間格式轉為 09:30 讓 Google 比較好懂
+        text = re.sub(r"(\d{1,2})點(\d{1,2})", r"\1:\2", text)
+        text = re.sub(r"(\d{1,2})點\b", r"\1:00", text)
         text = convert_jam_to_hhmm(text)
         text = expand_abbreviations(text)
     return text
 
-# --- Improved language detection ---
-_CJK_RE = re.compile(r'[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u2F800-\u2FA1F]')
-_ID_HINTS = re.compile(
-    r'\b(saya|aku|anda|kamu|kmu|makan|minum|tidur|pagi|siang|sore|malam|terima kasih|makasih|skrg|udh|blm|gk|ngga|krn|kl|jam)\b'
+
+# --- Chinese char detector ---
+_CJK_RE = re.compile(
+    r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u2F800-\u2FA1F]"
 )
 
-def normalize_lang_code(code):
-    """Normalize language codes into 'zh', 'id', or others."""
-    if not code:
-        return None
-    code = code.lower()
-    if code.startswith('zh') or code in {'cmn', 'zho'}:
-        return 'zh'
-    if code in {'id', 'in', 'ms'}:
-        return 'id'
-    return code
-
-
-def detect_language(text):
-    """Heuristic language detection: Chinese vs Indonesian vs others."""
-    t = text.strip()
-    if not t:
-        return None, text
-
-    # 1) Chinese character ratio
-    han = len(_CJK_RE.findall(t))
-    if han >= 2 or (han >= 1 and len(t) <= 6):
-        return 'zh', text
-
-    # 2) Indonesian hints
-    if _ID_HINTS.search(t.lower()):
-        return 'id', text
-
-    # 3) langdetect fallback
-    try:
-        raw = detect(t)
-        norm = normalize_lang_code(raw)
-        return norm, text
-    except LangDetectException:
-        return None, text
-
 # --- Translator singletons & cache ---
-translator_id_zh = GoogleTranslator(source="id", target="zh-TW")
-translator_zh_id = GoogleTranslator(source="zh-TW", target="id")
+# ❗重點：source 一律用 auto，避免 id/zh-TW 的怪問題
+translator_to_zh = GoogleTranslator(source="auto", target="zh-TW")
+translator_to_id = GoogleTranslator(source="auto", target="id")
 
 
 @lru_cache(maxsize=2048)
-def translate_cached(source, target, text):
-    """Cache by exact parameters (source,target,text)."""
+def translate_cached(target: str, text: str) -> str:
+    """
+    target: 'zh' or 'id'
+    """
     try:
-        if source.startswith('id'):
-            return translator_id_zh.translate(text)
-        if source.startswith('zh'):
-            return translator_zh_id.translate(text)
-        # fallback
-        return GoogleTranslator(source=source, target=target).translate(text)
+        if target == "zh":
+            return translator_to_zh.translate(text)
+        elif target == "id":
+            return translator_to_id.translate(text)
+        else:
+            return GoogleTranslator(source="auto", target=target).translate(text)
     except Exception as e:
         logger.exception("Translation engine error: %s", e)
         return "⚠️ 翻譯失敗"
 
 
 # --- Simple rate limiter (in-memory) ---
-RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))  # messages per minute per token/ip
+RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))
 _rate_store = {}  # key -> [count, window_start_ts]
 
 
-def rate_limited(key):
+def rate_limited(key: str) -> bool:
     now = int(time.time())
     window = 60
-    record = _rate_store.get(key, [0, now])
-    count, start = record
+    count, start = _rate_store.get(key, [0, now])
     if now - start >= window:
-        # reset
-        record = [0, now]
-        count, start = record
+        count, start = 0, now
     if count >= RATE_LIMIT:
         return True
-    record[0] += 1
-    _rate_store[key] = record
+    _rate_store[key] = [count + 1, start]
     return False
 
 
 # --- Main processing pipeline ---
-def process_message(text, client_key="anonymous"):
+def process_message(text: str, client_key: str = "anonymous") -> dict:
     text = text.strip()
     if not text:
         return {"error": "請輸入有效文字"}
 
     if rate_limited(client_key):
-        return {"error": "速率限制：每 60 秒最多 %d 次" % RATE_LIMIT}
+        return {"error": f"速率限制：每 60 秒最多 {RATE_LIMIT} 次"}
 
-    lang, cleaned = detect_language(text)
-    logger.info("process_message: detected=%s text=%s", lang, cleaned)
+    # 只拿來 log，實際方向不看這個
+    try:
+        detected = detect(text)
+    except LangDetectException:
+        detected = None
+    logger.info("raw langdetect=%s text=%s", detected, text)
 
-    if not lang:
-        return {"error": "無法偵測語言"}
+    han_count = len(_CJK_RE.findall(text))
+    logger.info("CJK count=%d", han_count)
 
-    lang = lang.lower()
+    # =========================
+    # 方向規則：
+    # - 有中文字：中文 ➜ 印尼文
+    # - 否則：印尼文 ➜ 中文
+    # =========================
 
-    if lang.startswith('id'):
-        expanded = expand_abbreviations(cleaned)
-        pre = preprocess_text(expanded, 'indonesian')
-        tr = translate_cached('id', 'zh-TW', pre)
-        polished = polish_chinese(tr)
-        save_to_sheet_row(text, polished, metadata={"direction": "id->zh", "client": client_key})
-        return {"result": polished, "original_expanded": expanded, "preprocessed": pre, "lang": "id"}
+    if han_count > 0:
+        # 中文 ➜ 印尼文
+        polished_in = polish_chinese(text)
+        tr = translate_cached("id", polished_in)
+        save_to_sheet_row(
+            text,
+            tr,
+            metadata={"direction": "zh->id", "client": client_key},
+        )
+        return {
+            "result": tr,
+            "polished_input": polished_in,
+            "lang": "zh",
+            "direction": "zh->id",
+        }
 
-    if lang.startswith('zh'):
-        polished_in = polish_chinese(cleaned)
-        tr = translate_cached('zh-TW', 'id', polished_in)
-        save_to_sheet_row(text, tr, metadata={"direction": "zh->id", "client": client_key})
-        return {"result": tr, "polished_input": polished_in, "lang": "zh"}
-
-    # Fallback: if still not zh/id but text looks like zh or id
-    han = len(_CJK_RE.findall(cleaned))
-    if han >= 2:
-        polished_in = polish_chinese(cleaned)
-        tr = translate_cached('zh-TW', 'id', polished_in)
-        save_to_sheet_row(text, tr, metadata={"direction": "zh->id(fallback)", "client": client_key})
-        return {"result": tr, "polished_input": polished_in, "lang": "zh-fallback"}
-
-    if _ID_HINTS.search(cleaned.lower()):
-        expanded = expand_abbreviations(cleaned)
-        pre = preprocess_text(expanded, 'indonesian')
-        tr = translate_cached('id', 'zh-TW', pre)
-        polished = polish_chinese(tr)
-        save_to_sheet_row(text, polished, metadata={"direction": "id->zh(fallback)", "client": client_key})
-        return {"result": polished, "original_expanded": expanded, "preprocessed": pre, "lang": "id-fallback"}
-
-    return {"error": "僅支援中文與印尼文"}
+    else:
+        # 印尼文（或其它非中文文字） ➜ 中文
+        pre = preprocess_text(text, "indonesian")
+        tr = translate_cached("zh", pre)
+        polished_out = polish_chinese(tr)
+        save_to_sheet_row(
+            text,
+            polished_out,
+            metadata={"direction": "id->zh", "client": client_key},
+        )
+        return {
+            "result": polished_out,
+            "original_preprocessed": pre,
+            "lang": "id",
+            "direction": "id->zh",
+        }
 
 
 # --- Flask endpoints ---
@@ -432,7 +450,6 @@ def translate_api():
 
 @app.route("/history", methods=["GET"])
 def history():
-    # basic: if Google Sheet configured, return last N rows (limited)
     if not sheet:
         return jsonify({"error": "Google Sheets 未配置"}), 400
     n = int(request.args.get("n", 20))
@@ -446,8 +463,7 @@ def history():
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    # LINE signature validated by parser/handler
-    signature = request.headers.get('X-Line-Signature', '')
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
     if not handler or not line_bot_api:
         logger.warning("LINE not configured; ignoring callback.")
@@ -456,7 +472,6 @@ def callback():
         handler.handle(body, signature)
     except Exception as e:
         logger.exception("LINE webhook handle error: %s", e)
-        return "OK", 200
     return "OK", 200
 
 
@@ -465,25 +480,33 @@ if handler:
     def handle_message(event):
         try:
             user_msg = event.message.text
-            user_id = getattr(event.source, "user_id", None) or getattr(event.source, "group_id", None) or "unknown"
-            client_key = "line:%s" % user_id
+            user_id = (
+                getattr(event.source, "user_id", None)
+                or getattr(event.source, "group_id", None)
+                or "unknown"
+            )
+            client_key = f"line:{user_id}"
             res = process_message(user_msg, client_key=client_key)
             if "result" in res:
-                reply_text = u"🗣️ 翻譯結果：%s" % res["result"]
+                reply_text = f"🗣️ 翻譯結果：{res['result']}"
             else:
-                reply_text = u"⚠️ %s" % res.get("error", "處理失敗")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+                reply_text = f"⚠️ {res.get('error', '處理失敗')}"
+            line_bot_api.reply_message(
+                event.reply_token, TextSendMessage(text=reply_text)
+            )
         except Exception as e:
             logger.exception("Error in handle_message: %s", e)
             try:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text="⚠️ 內部錯誤"))
+                line_bot_api.reply_message(
+                    event.reply_token, TextSendMessage(text="⚠️ 內部錯誤")
+                )
             except Exception:
                 pass
 
 
 # --- Run ---
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", 5000))
     host = os.getenv("HOST", "0.0.0.0")
     logger.info("Starting Flask app on %s:%d", host, port)
     app.run(host=host, port=port, debug=os.getenv("FLASK_DEBUG", "0") == "1")
