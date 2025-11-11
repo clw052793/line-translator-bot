@@ -4,7 +4,7 @@ import json
 import string
 import logging
 import time
-from functools import lru_cache
+from functools import lru_cache, wraps
 from io import StringIO
 from dotenv import load_dotenv
 
@@ -343,7 +343,7 @@ chinese_indonesian_vocab = {
     "水": "air",
     "開水": "air rebus",
     "下大雨": "hujan deras",
-    "雨停": "hujan berh停",
+    "雨停": "hujan berhenti",
     "樓上": "lantai atas",
     "外面": "luar",
     "拿": "ambil",
@@ -417,18 +417,18 @@ def detect_language(text: str):
     if re.search(r'[\u4e00-\u9fff]', t):
         return 'chinese', text
 
-    # 2) 先抓裡面的英文單字，看有沒有在縮寫字典裡（包含 lya, ce 等）
+    # 2) 先抓裡面的英文單字，看有沒有在縮寫字典裡
     tokens = re.findall(r'[A-Za-z]+', t.lower())
     if any(tok in indonesian_abbreviation_map for tok in tokens):
         return 'indonesian', text
 
-    # 3) 原本就有的印尼關鍵詞啟發式
+    # 3) 印尼關鍵詞啟發式
     if re.search(r'\b(saya|aku|makan|tidur|pagi|selamat|terima kasih|kamu|kmu|mkn|udh)\b', t.lower()):
         return 'indonesian', text
 
-    # 4) 最後才交給 langdetect，並做簡單 mapping
+    # 4) 最後才用 langdetect
     try:
-        detected = detect(t)  # 例如 'id', 'in', 'ms', 'zh-cn', 'en'...
+        detected = detect(t)
         d_lower = detected.lower()
         if d_lower in ('id', 'in', 'ms'):
             return 'indonesian', text
@@ -538,58 +538,52 @@ def _make_glossary_pairs():
             lines.append(f"  - {k} -> {v}")
     return "\n".join(lines)
 
-def _extract_text_from_response(resp) -> str:
-    """從 Responses API 回傳物件中抓出第一段文字。"""
-    try:
-        output_list = getattr(resp, "output", None)
-        if not output_list:
-            return ""
-        first = output_list[0]
-        content = getattr(first, "content", None)
-        if not content:
-            return ""
-        c0 = content[0]
-        text_obj = getattr(c0, "text", None)
-        if text_obj and hasattr(text_obj, "value"):
-            return (text_obj.value or "").strip()
-        return ""
-    except Exception:
-        return ""
-
 def openai_translate(src_lang, tgt_lang, text: str):
     """
-    直接透過 OpenAI 做翻譯（不用 Google 當 baseline）。
-    出錯時丟例外，外層會負責 fallback。
+    直接透過 OpenAI Chat Completions 做翻譯。
+    出錯時丟例外，外層會 fallback。
     """
     if not _openai_client:
         raise RuntimeError("OpenAI client not configured")
 
     glossary_hint = _make_glossary_pairs()
-    prompt = (
+
+    system_prompt = (
         "You are a professional translator between Indonesian and Traditional Chinese "
         "for elderly caregiving daily conversation.\n\n"
-        f"Source language: {src_lang}\n"
-        f"Target language: {tgt_lang}\n\n"
         "Important domain terms and chat abbreviations:\n"
         f"{glossary_hint}\n\n"
         "Instructions:\n"
         "1) 保留人名、專有名詞與數字。\n"
         "2) 若文字中已有 HH:MM（24 小時制）時間格式，請完整保留，不要改動。\n"
-        "3) 口吻自然、簡單、禮貌，符合日常對話（照護情境）。\n"
+        "3) 口吻自然、簡單、禮貌，符合日常照護對話。\n"
         "4) 不要加解釋或註解，只輸出目標語言翻譯句子。\n"
-        "5) 如果原文很口語或有縮寫（例如印尼聊天用語），請先理解後，用清楚自然的目標語言重寫。\n\n"
-        "Translate the following text:\n"
+        "5) 對印尼聊天縮寫要先理解再翻成清楚自然的句子。\n"
+    )
+
+    user_prompt = (
+        f"Source language: {src_lang}\n"
+        f"Target language: {tgt_lang}\n\n"
+        "Translate the following text. Only reply with the translation in the target language:\n"
         f"<<<{text}>>>"
     )
 
-    resp = _openai_client.responses.create(
+    resp = _openai_client.chat.completions.create(
         model=OPENAI_MODEL,
-        input=prompt,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
     )
-    translated = _extract_text_from_response(resp)
+
+    try:
+        translated = resp.choices[0].message.content.strip()
+    except Exception:
+        translated = ""
+
     if not translated:
         raise RuntimeError("Empty translation from OpenAI")
-    return translated.strip()
+    return translated
 
 # --- Simple rate limiter (in-memory) ---
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))  # messages per minute per token/ip
