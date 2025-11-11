@@ -590,7 +590,6 @@ def refine_with_openai(src_lang, tgt_lang, source_text, baseline_text):
         resp = _openai_client.responses.create(
             model=OPENAI_MODEL,
             input=prompt,
-            temperature=0.2,
         )
         refined = _extract_text_from_response(resp)
         if not refined:
@@ -599,6 +598,7 @@ def refine_with_openai(src_lang, tgt_lang, source_text, baseline_text):
     except Exception as e:
         logger.exception("OpenAI refine error: %s", e)
         return baseline_text, {"source": "baseline-fallback-exception"}
+
 
 # --- Simple rate limiter (in-memory) ---
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))  # messages per minute per token/ip
