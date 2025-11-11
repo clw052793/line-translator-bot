@@ -4,7 +4,7 @@ import json
 import string
 import logging
 import time
-from functools import lru_cache, wraps
+from functools import lru_cache
 from io import StringIO
 from dotenv import load_dotenv
 
@@ -343,7 +343,7 @@ chinese_indonesian_vocab = {
     "水": "air",
     "開水": "air rebus",
     "下大雨": "hujan deras",
-    "雨停": "hujan berhenti",
+    "雨停": "hujan berh停",
     "樓上": "lantai atas",
     "外面": "luar",
     "拿": "ambil",
@@ -499,32 +499,31 @@ def preprocess_text(text: str, lang: str) -> str:
         text = expand_abbreviations(text)
     return text
 
-# --- Translator singletons & cache ---
+# --- Translator singletons & cache (Google, 作為 fallback) ---
 translator_id_zh = GoogleTranslator(source="id", target="zh-TW")
 translator_zh_id = GoogleTranslator(source="zh-TW", target="id")
 
 @lru_cache(maxsize=2048)
 def translate_cached(source, target, text):
-    """Cache by exact parameters (source,target,text)."""
+    """Google 翻譯（cache）"""
     try:
         if source.startswith('id'):
             return translator_id_zh.translate(text)
         if source.startswith('zh'):
             return translator_zh_id.translate(text)
-        # fallback
         return GoogleTranslator(source=source, target=target).translate(text)
     except Exception as e:
-        logger.exception("Translation engine error: %s", e)
+        logger.exception("Translation engine error (Google): %s", e)
         return "⚠️ 翻譯失敗"
 
-# --- OpenAI refine helpers ---
+# --- OpenAI 翻譯設定 ---
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 _openai_client = OpenAI(api_key=OPENAI_KEY) if (OPENAI_KEY and OpenAI) else None
 
 def _make_glossary_pairs():
     """把縮寫/詞彙對照整理進 prompt，避免太長。"""
-    N = 80  # 限制長度
+    N = 80
     id_abbr_items = list(indonesian_abbreviation_map.items())[:N]
     zh_id_items = list(chinese_indonesian_vocab.items())[:N]
 
@@ -540,11 +539,8 @@ def _make_glossary_pairs():
     return "\n".join(lines)
 
 def _extract_text_from_response(resp) -> str:
-    """
-    從 OpenAI Responses API 回傳物件中抓出第一段文字。
-    """
+    """從 Responses API 回傳物件中抓出第一段文字。"""
     try:
-        # openai>=1.0 的 Responses 結構：resp.output[0].content[0].text.value
         output_list = getattr(resp, "output", None)
         if not output_list:
             return ""
@@ -560,45 +556,40 @@ def _extract_text_from_response(resp) -> str:
     except Exception:
         return ""
 
-def refine_with_openai(src_lang, tgt_lang, source_text, baseline_text):
+def openai_translate(src_lang, tgt_lang, text: str):
     """
-    用 OpenAI 對 baseline 翻譯做『用詞修正/潤飾/一致性』。
-    若未設 API key 或錯誤，直接返回 baseline。
+    直接透過 OpenAI 做翻譯（不用 Google 當 baseline）。
+    出錯時丟例外，外層會負責 fallback。
     """
     if not _openai_client:
-        return baseline_text, {"source": "baseline-only"}
+        raise RuntimeError("OpenAI client not configured")
 
     glossary_hint = _make_glossary_pairs()
-    rules = (
-        "Rules:\n"
-        "1) 保留人名、專有名詞與數字。\n"
-        "2) HH:MM（24 小時制）時間格式不得改動；jam/pagi/siang/sore/malam 已預先換算。\n"
-        "3) 語氣自然、禮貌但簡潔，不要硬加太多字。\n"
-        "4) 僅輸出目標語言最終譯文，不要解釋或使用 Markdown。\n"
-        "5) baseline 已經很好時，只做最小幅度微調（標點、用詞統一）。\n"
-    )
-
     prompt = (
-        f"Task: You are a professional bilingual editor.\n"
-        f"Source language: {src_lang}\nTarget language: {tgt_lang}\n\n"
-        f"Source text:\n<<<{source_text}>>>\n\n"
-        f"Baseline translation:\n<<<{baseline_text}>>>\n\n"
-        f"{glossary_hint}\n\n{rules}"
+        "You are a professional translator between Indonesian and Traditional Chinese "
+        "for elderly caregiving daily conversation.\n\n"
+        f"Source language: {src_lang}\n"
+        f"Target language: {tgt_lang}\n\n"
+        "Important domain terms and chat abbreviations:\n"
+        f"{glossary_hint}\n\n"
+        "Instructions:\n"
+        "1) 保留人名、專有名詞與數字。\n"
+        "2) 若文字中已有 HH:MM（24 小時制）時間格式，請完整保留，不要改動。\n"
+        "3) 口吻自然、簡單、禮貌，符合日常對話（照護情境）。\n"
+        "4) 不要加解釋或註解，只輸出目標語言翻譯句子。\n"
+        "5) 如果原文很口語或有縮寫（例如印尼聊天用語），請先理解後，用清楚自然的目標語言重寫。\n\n"
+        "Translate the following text:\n"
+        f"<<<{text}>>>"
     )
 
-    try:
-        resp = _openai_client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
-        )
-        refined = _extract_text_from_response(resp)
-        if not refined:
-            return baseline_text, {"source": "baseline-fallback-empty"}
-        return refined, {"source": "openai", "model": OPENAI_MODEL}
-    except Exception as e:
-        logger.exception("OpenAI refine error: %s", e)
-        return baseline_text, {"source": "baseline-fallback-exception"}
-
+    resp = _openai_client.responses.create(
+        model=OPENAI_MODEL,
+        input=prompt,
+    )
+    translated = _extract_text_from_response(resp)
+    if not translated:
+        raise RuntimeError("Empty translation from OpenAI")
+    return translated.strip()
 
 # --- Simple rate limiter (in-memory) ---
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))  # messages per minute per token/ip
@@ -610,7 +601,6 @@ def rate_limited(key):
     record = _rate_store.get(key, [0, now])
     count, start = record
     if now - start >= window:
-        # reset
         record = [0, now]
         count, start = record
     if count >= RATE_LIMIT:
@@ -634,40 +624,65 @@ def process_message(text: str, client_key: str = "anonymous") -> dict:
     if not lang:
         return {"error": "無法偵測語言"}
 
-    # 🔧 統一成小寫，避免 'ID' / 'ZH-CN' 之類
     lang = str(lang).lower()
 
+    # 印尼文 -> 中文
     if lang == 'indonesian' or lang.startswith('id'):
         expanded = expand_abbreviations(cleaned)
         pre = preprocess_text(expanded, 'indonesian')
 
-        # baseline by Google
-        base = translate_cached('id', 'zh-TW', pre)
-        refined, meta = refine_with_openai("Indonesian", "Traditional Chinese", pre, base)
-        polished = polish_chinese(refined)
+        meta = {}
+        result = None
 
-        save_to_sheet_row(text, polished, metadata={"direction":"id->zh", "client": client_key, "refine": meta})
+        # 優先使用 OpenAI
+        try:
+            if _openai_client:
+                result = openai_translate("Indonesian", "Traditional Chinese", pre)
+                result = polish_chinese(result)
+                meta = {"source": "openai", "model": OPENAI_MODEL}
+        except Exception as e:
+            logger.exception("OpenAI translate error (id->zh), falling back: %s", e)
+
+        # 若 OpenAI 失敗則 fallback Google
+        if not result:
+            base = translate_cached('id', 'zh-TW', pre)
+            result = polish_chinese(base)
+            meta = {"source": "google-fallback"}
+
+        save_to_sheet_row(text, result, metadata={"direction": "id->zh", "client": client_key, "meta": meta})
         return {
-            "result": polished,
+            "result": result,
             "original_expanded": expanded,
             "preprocessed": pre,
             "lang": "id",
-            "meta": meta
+            "meta": meta,
         }
 
+    # 中文 -> 印尼文
     elif lang == 'chinese' or lang.startswith('zh'):
         polished_in = polish_chinese(cleaned)
 
-        # baseline by Google
-        base = translate_cached('zh-TW', 'id', polished_in)
-        refined, meta = refine_with_openai("Traditional Chinese", "Indonesian", polished_in, base)
+        meta = {}
+        result = None
 
-        save_to_sheet_row(text, refined, metadata={"direction":"zh->id", "client": client_key, "refine": meta})
+        try:
+            if _openai_client:
+                result = openai_translate("Traditional Chinese", "Indonesian", polished_in)
+                meta = {"source": "openai", "model": OPENAI_MODEL}
+        except Exception as e:
+            logger.exception("OpenAI translate error (zh->id), falling back: %s", e)
+
+        if not result:
+            base = translate_cached('zh-TW', 'id', polished_in)
+            result = base
+            meta = {"source": "google-fallback"}
+
+        save_to_sheet_row(text, result, metadata={"direction": "zh->id", "client": client_key, "meta": meta})
         return {
-            "result": refined,
+            "result": result,
             "polished_input": polished_in,
             "lang": "zh",
-            "meta": meta
+            "meta": meta,
         }
 
     else:
@@ -706,7 +721,6 @@ def history():
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    # LINE signature validated by parser/handler
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
     if not handler or not line_bot_api:
