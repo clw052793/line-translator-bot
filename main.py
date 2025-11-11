@@ -25,6 +25,12 @@ try:
 except Exception:
     GS_AVAILABLE = False
 
+# Optional OpenAI
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 # --- Load .env ---
 load_dotenv()
 
@@ -356,7 +362,7 @@ chinese_indonesian_vocab = {
     "明天": "besok",
     "簽收": "tanda tangan",
     "上次": "terakhir",
-    "外箱": "kotak luar",
+    "外箱": "kotak外",
     "粉紅色": "merah muda",
     "下面": "di bawah",
     "還沒": "belum",
@@ -450,7 +456,10 @@ def convert_jam_to_hhmm(text: str) -> str:
         return f"{h:02d}:{m:02d}"
 
     # jam 3 sore
-    pattern_period = re.compile(r'\bjam\s*(\d{1,2})(?:[:.,](\d{1,2}|\d*\.\d+))?\s*(pagi|siang|sore|malam|am|pm|a\.m\.|p\.m\.)\b', flags=re.IGNORECASE)
+    pattern_period = re.compile(
+        r'\bjam\s*(\d{1,2})(?:[:.,](\d{1,2}|\d*\.\d+))?\s*(pagi|siang|sore|malam|am|pm|a\.m\.|p\.m\.)\b',
+        flags=re.IGNORECASE
+    )
     def repl_period(m):
         h = int(m.group(1))
         minpart = m.group(2)
@@ -508,6 +517,89 @@ def translate_cached(source, target, text):
         logger.exception("Translation engine error: %s", e)
         return "⚠️ 翻譯失敗"
 
+# --- OpenAI refine helpers ---
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+_openai_client = OpenAI(api_key=OPENAI_KEY) if (OPENAI_KEY and OpenAI) else None
+
+def _make_glossary_pairs():
+    """把縮寫/詞彙對照整理進 prompt，避免太長。"""
+    N = 80  # 限制長度
+    id_abbr_items = list(indonesian_abbreviation_map.items())[:N]
+    zh_id_items = list(chinese_indonesian_vocab.items())[:N]
+
+    lines = []
+    if id_abbr_items:
+        lines.append("• Indonesian chat abbreviations:")
+        for k, v in id_abbr_items:
+            lines.append(f"  - {k} -> {v}")
+    if zh_id_items:
+        lines.append("• Chinese→Indonesian domain terms:")
+        for k, v in zh_id_items:
+            lines.append(f"  - {k} -> {v}")
+    return "\n".join(lines)
+
+def _extract_text_from_response(resp) -> str:
+    """
+    從 OpenAI Responses API 回傳物件中抓出第一段文字。
+    """
+    try:
+        # openai>=1.0 的 Responses 結構：resp.output[0].content[0].text.value
+        output_list = getattr(resp, "output", None)
+        if not output_list:
+            return ""
+        first = output_list[0]
+        content = getattr(first, "content", None)
+        if not content:
+            return ""
+        c0 = content[0]
+        text_obj = getattr(c0, "text", None)
+        if text_obj and hasattr(text_obj, "value"):
+            return (text_obj.value or "").strip()
+        return ""
+    except Exception:
+        return ""
+
+def refine_with_openai(src_lang, tgt_lang, source_text, baseline_text):
+    """
+    用 OpenAI 對 baseline 翻譯做『用詞修正/潤飾/一致性』。
+    若未設 API key 或錯誤，直接返回 baseline。
+    """
+    if not _openai_client:
+        return baseline_text, {"source": "baseline-only"}
+
+    glossary_hint = _make_glossary_pairs()
+    rules = (
+        "Rules:\n"
+        "1) 保留人名、專有名詞與數字。\n"
+        "2) HH:MM（24 小時制）時間格式不得改動；jam/pagi/siang/sore/malam 已預先換算。\n"
+        "3) 語氣自然、禮貌但簡潔，不要硬加太多字。\n"
+        "4) 僅輸出目標語言最終譯文，不要解釋或使用 Markdown。\n"
+        "5) baseline 已經很好時，只做最小幅度微調（標點、用詞統一）。\n"
+    )
+
+    prompt = (
+        f"Task: You are a professional bilingual editor.\n"
+        f"Source language: {src_lang}\nTarget language: {tgt_lang}\n\n"
+        f"Source text:\n<<<{source_text}>>>\n\n"
+        f"Baseline translation:\n<<<{baseline_text}>>>\n\n"
+        f"{glossary_hint}\n\n{rules}"
+    )
+
+    try:
+        resp = _openai_client.responses.create(
+            model=OPENAI_MODEL,
+            input=prompt,
+            temperature=0.2,
+        )
+        refined = _extract_text_from_response(resp)
+        if not refined:
+            return baseline_text, {"source": "baseline-fallback-empty"}
+        return refined, {"source": "openai", "model": OPENAI_MODEL}
+    except Exception as e:
+        logger.exception("OpenAI refine error: %s", e)
+        return baseline_text, {"source": "baseline-fallback-exception"}
+
 # --- Simple rate limiter (in-memory) ---
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))  # messages per minute per token/ip
 _rate_store = {}  # key -> [count, window_start_ts]
@@ -534,7 +626,7 @@ def process_message(text: str, client_key: str = "anonymous") -> dict:
         return {"error": "請輸入有效文字"}
 
     if rate_limited(client_key):
-        return {"error": f"速率限制：每 {60} 秒最多 {RATE_LIMIT} 次"}
+        return {"error": f"速率限制：每 60 秒最多 {RATE_LIMIT} 次"}
 
     lang, cleaned = detect_language(text)
     logger.info("process_message: detected=%s text=%s", lang, cleaned)
@@ -548,15 +640,36 @@ def process_message(text: str, client_key: str = "anonymous") -> dict:
     if lang == 'indonesian' or lang.startswith('id'):
         expanded = expand_abbreviations(cleaned)
         pre = preprocess_text(expanded, 'indonesian')
-        tr = translate_cached('id', 'zh-TW', pre)
-        polished = polish_chinese(tr)
-        save_to_sheet_row(text, polished, metadata={"direction":"id->zh", "client": client_key})
-        return {"result": polished, "original_expanded": expanded, "preprocessed": pre, "lang": "id"}
+
+        # baseline by Google
+        base = translate_cached('id', 'zh-TW', pre)
+        refined, meta = refine_with_openai("Indonesian", "Traditional Chinese", pre, base)
+        polished = polish_chinese(refined)
+
+        save_to_sheet_row(text, polished, metadata={"direction":"id->zh", "client": client_key, "refine": meta})
+        return {
+            "result": polished,
+            "original_expanded": expanded,
+            "preprocessed": pre,
+            "lang": "id",
+            "meta": meta
+        }
+
     elif lang == 'chinese' or lang.startswith('zh'):
         polished_in = polish_chinese(cleaned)
-        tr = translate_cached('zh-TW', 'id', polished_in)
-        save_to_sheet_row(text, tr, metadata={"direction":"zh->id", "client": client_key})
-        return {"result": tr, "polished_input": polished_in, "lang": "zh"}
+
+        # baseline by Google
+        base = translate_cached('zh-TW', 'id', polished_in)
+        refined, meta = refine_with_openai("Traditional Chinese", "Indonesian", polished_in, base)
+
+        save_to_sheet_row(text, refined, metadata={"direction":"zh->id", "client": client_key, "refine": meta})
+        return {
+            "result": refined,
+            "polished_input": polished_in,
+            "lang": "zh",
+            "meta": meta
+        }
+
     else:
         return {"error": "僅支援中文與印尼文"}
 
@@ -567,7 +680,7 @@ def ping():
 
 @app.route("/health", methods=["GET"])
 def health():
-    ok = {"ok": True, "sheets": bool(sheet)}
+    ok = {"ok": True, "sheets": bool(sheet), "openai": bool(_openai_client)}
     return jsonify(ok), 200
 
 @app.route("/translate", methods=["POST"])
@@ -630,5 +743,8 @@ if handler:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     host = os.getenv("HOST", "0.0.0.0")
-    logger.info("Starting Flask app on %s:%d", host, port)
+    logger.info(
+        "Starting Flask app on %s:%d (OPENAI_MODEL=%s, openai_enabled=%s)",
+        host, port, OPENAI_MODEL, bool(_openai_client)
+    )
     app.run(host=host, port=port, debug=os.getenv("FLASK_DEBUG", "0") == "1")
