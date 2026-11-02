@@ -548,51 +548,51 @@ def expand_abbreviations(text):
 # ============================================================
 
 def detect_language(text):
-
+    """Detect Chinese, Indonesian, or English; avoid broad glossary false positives."""
     t = text.strip()
-
     if not t:
         return None, text
 
-    # 中文優先
     if re.search(r'[\u4e00-\u9fff]', t):
         return "chinese", text
 
-    tokens = re.findall(
-        r'[A-Za-z0-9]+',
-        t.lower()
-    )
+    tokens = re.findall(r"[A-Za-z]+", t.lower())
+    if not tokens:
+        return None, text
 
-    # 印尼文詞庫
-    if any(
-        token in indonesian_abbreviation_map
-        or token in indonesian_normalization_map
-        for token in tokens
-    ):
+    # Unambiguous Indonesian words / messaging abbreviations.
+    indonesian_clues = {
+        "saya", "aku", "kamu", "nenek", "makan", "minum", "tidur",
+        "sudah", "belum", "besok", "tolong", "jangan", "berapa",
+        "kenapa", "bagaimana", "terima", "kasih", "udh", "blm",
+        "mkn", "gpp", "klo", "nggak", "makasih", "skrg", "pagi",
+        "siang", "sore", "malam", "cece", "mandi", "bsk", "kmrn",
+        "syg", "ngga", "gk", "trus", "tpi", "krn", "bisa"
+    }
+    english_clues = {
+        "the", "is", "are", "was", "were", "have", "has", "had",
+        "please", "good", "morning", "hello", "thanks", "thank",
+        "you", "your", "we", "they", "this", "that", "with", "for",
+        "from", "grandma", "medicine", "today", "tomorrow", "eat",
+        "drink", "sleep", "can", "could", "would", "should", "do",
+        "does", "did", "what", "when", "where", "how", "why"
+    }
+    id_count = sum(token in indonesian_clues for token in tokens)
+    en_count = sum(token in english_clues for token in tokens)
+    if id_count > en_count and id_count:
         return "indonesian", text
-
-    # 印尼文常見詞
-    if re.search(
-        r'\b(saya|aku|kamu|nenek|makan|'
-        r'tidur|sudah|belum|besok|pagi|'
-        r'siang|sore|malam|terima|kasih|'
-        r'berapa|kenapa|bagaimana|'
-        r'bisa|tolong|jangan)\b',
-        t.lower()
-    ):
-        return "indonesian", text
+    if en_count > id_count and en_count:
+        return "english", text
 
     try:
         detected = detect(t).lower()
-
-        if detected in ("id", "in", "ms"):
+        if detected in ("id", "ms"):
             return "indonesian", text
-
         if detected.startswith("zh"):
             return "chinese", text
-
+        if detected == "en":
+            return "english", text
         return detected, text
-
     except LangDetectException:
         return None, text
 
@@ -750,7 +750,7 @@ def make_glossary(text, source_lang):
                         f"{key}: {meaning}"
                     )
 
-    else:
+    elif source_lang == "Traditional Chinese":
 
         for key in SPECIAL_ZH_TERMS:
 
@@ -830,7 +830,7 @@ def cache_set(key, value):
 
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
-    "gpt-6-luna"
+    "gpt-5-mini"
 )
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -1002,7 +1002,7 @@ def openai_translate(src_lang, tgt_lang, text):
     )
 
     system_prompt = (
-        "You translate Indonesian and Traditional "
+        "You translate Indonesian, English, and Traditional "
         "Chinese for everyday elderly-care conversations. "
         "Produce natural, grammatically correct, "
         "faithful translations. Understand Indonesian "
@@ -1328,11 +1328,18 @@ def process_message(
 
         direction = "zh->id"
 
-    else:
+    # English -> Traditional Chinese
+    elif lang in ("english", "en"):
 
-        return {
-            "error": "僅支援中文與印尼文"
-        }
+        pre = cleaned
+        src_lang = "English"
+        tgt_lang = "Traditional Chinese"
+        google_source = "en"
+        google_target = "zh-TW"
+        direction = "en->zh"
+
+    else:
+        return {"error": "僅支援中文、印尼文與英文"}
 
     # 依模型、翻譯方向、文字區分快取
     cache_key = (
@@ -1446,11 +1453,11 @@ def process_message(
 
     response = {
         "result": result,
-        "lang": (
-            "id"
-            if direction == "id->zh"
-            else "zh"
-        ),
+        "lang": {
+            "id->zh": "id",
+            "zh->id": "zh",
+            "en->zh": "en"
+        }[direction],
         "meta": meta
     }
 
