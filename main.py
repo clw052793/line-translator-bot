@@ -548,7 +548,7 @@ def expand_abbreviations(text):
 # ============================================================
 
 def detect_language(text):
-    """Detect Chinese, Indonesian, or English; avoid broad glossary false positives."""
+    """Identify Chinese, Indonesian and English, including very short chats."""
     t = text.strip()
     if not t:
         return None, text
@@ -560,7 +560,30 @@ def detect_language(text):
     if not tokens:
         return None, text
 
-    # Unambiguous Indonesian words / messaging abbreviations.
+    # Single-word chat messages must not depend on statistical detection.
+    short_english = {
+        "hi", "hey", "hello", "ok", "okay", "okey", "yes", "no",
+        "thanks", "thank", "bye", "goodbye", "sorry", "please",
+        "good", "morning", "night", "fine", "sure", "welcome"
+    }
+    short_indonesian = {
+        "iya", "ya", "nggak", "ngga", "ga", "gk", "tidak",
+        "bukan", "gpp", "gapapa", "udh", "udah", "sudah", "blm",
+        "belum", "mkn", "makan", "makasih", "terimakasih",
+        "besok", "bsk", "pagi", "siang", "sore", "malam", "nenek",
+        "ce", "cece", "kak", "tolong", "bisa", "sip", "mantap"
+    }
+    if len(tokens) == 1:
+        word = tokens[0]
+        if word in short_english:
+            return "english", text
+        if word in short_indonesian:
+            return "indonesian", text
+        # A short Latin-alphabet word is more useful treated as English
+        # than rejected as an unsupported language.
+        if len(word) <= 4:
+            return "english", text
+
     indonesian_clues = {
         "saya", "aku", "kamu", "nenek", "makan", "minum", "tidur",
         "sudah", "belum", "besok", "tolong", "jangan", "berapa",
@@ -592,9 +615,11 @@ def detect_language(text):
             return "chinese", text
         if detected == "en":
             return "english", text
-        return detected, text
+        # When detection picks an unrelated language for Latin text,
+        # fall back to English instead of rejecting the chat message.
+        return "english", text
     except LangDetectException:
-        return None, text
+        return "english", text
 
 
 # ============================================================
