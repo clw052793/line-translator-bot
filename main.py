@@ -1,9 +1,15 @@
+
 import os
 import re
 import json
+import hmac
 import logging
 import time
-from functools import lru_cache
+import threading
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from flask import Flask, request, jsonify
@@ -12,10 +18,11 @@ from langdetect.lang_detect_exception import LangDetectException
 
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextMessage, MessageEvent, TextSendMessage
+from linebot.exceptions import InvalidSignatureError
 
 from deep_translator import GoogleTranslator
 
-# Optional Google Sheets
+# --- Optional Google Sheets ---
 try:
     import gspread
     from oauth2client.service_account import ServiceAccountCredentials
@@ -23,7 +30,7 @@ try:
 except ImportError:
     GS_AVAILABLE = False
 
-# Optional OpenAI
+# --- Optional OpenAI ---
 try:
     from openai import OpenAI
 except ImportError:
@@ -31,7 +38,7 @@ except ImportError:
 
 
 # ============================================================
-# 1. Load environment
+# 1. Environment and logging
 # ============================================================
 
 load_dotenv()
@@ -43,6 +50,12 @@ logging.basicConfig(
 logger = logging.getLogger("line-translator")
 
 app = Flask(__name__)
+
+DetectorFactory.seed = 0
+
+MAX_TEXT_LENGTH = int(
+    os.getenv("MAX_TEXT_LENGTH", "3000")
+)
 
 
 # ============================================================
@@ -57,9 +70,6 @@ LINE_CHANNEL_SECRET = os.getenv(
     "LINE_CHANNEL_SECRET"
 )
 
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    logger.warning("LINE token or secret not configured")
-
 line_bot_api = (
     LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     if LINE_CHANNEL_ACCESS_TOKEN
@@ -72,11 +82,12 @@ handler = (
     else None
 )
 
-DetectorFactory.seed = 0
+if not line_bot_api or not handler:
+    logger.warning("LINE credentials are missing")
 
 
 # ============================================================
-# 3. Google Sheets
+# 3. Google Sheets setup
 # ============================================================
 
 sheet = None
@@ -93,18 +104,18 @@ if GS_AVAILABLE and GS_KEY and GS_JSON:
 
     try:
         try:
-            creds_dict = json.loads(GS_JSON)
+            credentials_dict = json.loads(GS_JSON)
 
-            creds = (
+            credentials = (
                 ServiceAccountCredentials
                 .from_json_keyfile_dict(
-                    creds_dict,
+                    credentials_dict,
                     scope
                 )
             )
 
-        except (json.JSONDecodeError, TypeError):
-            creds = (
+        except json.JSONDecodeError:
+            credentials = (
                 ServiceAccountCredentials
                 .from_json_keyfile_name(
                     GS_JSON,
@@ -112,21 +123,20 @@ if GS_AVAILABLE and GS_KEY and GS_JSON:
                 )
             )
 
-        gc = gspread.authorize(creds)
+        gc = gspread.authorize(credentials)
 
         sheet = gc.open_by_key(GS_KEY).sheet1
 
         logger.info("Google Sheets connected")
 
-    except Exception as e:
+    except Exception:
         logger.exception(
-            "Google Sheets initialization failed: %s",
-            e
+            "Google Sheets initialization failed"
         )
 
 
 # ============================================================
-# 4. Indonesian abbreviation dictionary
+# 4. Original Indonesian dictionary
 # ============================================================
 
 indonesian_abbreviation_map = {
@@ -177,7 +187,7 @@ indonesian_abbreviation_map = {
     "pagi2": "早上早點",
     "siang2": "中午時候",
 
-    # 照護與生活
+    # 照護與生活動作
     "makan": "吃",
     "mkn": "吃",
     "minum": "喝",
@@ -203,7 +213,7 @@ indonesian_abbreviation_map = {
     "tutup": "關上",
     "buka": "打開",
 
-    # 聊天縮寫
+    # 聊天口語縮寫
     "aj": "aja",
     "ajh": "aja",
     "aja": "就好",
@@ -272,7 +282,7 @@ indonesian_abbreviation_map = {
     "jendela": "窗戶",
     "halaman": "院子",
 
-    # 工作與學校
+    # 工作、單位與學校
     "bca": "銀行",
     "pt": "有限公司",
     "sd": "小學",
@@ -289,7 +299,7 @@ indonesian_abbreviation_map = {
     "umkm": "微型企業",
     "wmm": "微型企業",
 
-    # 其他
+    # 其他補充
     "faq": "常見問題",
     "bkn": "不是",
     "bsa": "bisa",
@@ -330,7 +340,7 @@ indonesian_abbreviation_map = {
 
 
 # ============================================================
-# 5. Chinese-Indonesian vocabulary
+# 5. Original Chinese-Indonesian vocabulary
 # ============================================================
 
 chinese_indonesian_vocab = {
@@ -425,81 +435,16 @@ chinese_indonesian_vocab = {
     "下面": "di bawah",
     "還沒": "belum",
     "遵循": "mengikuti",
-    "日期順序": "urutan tanggal"
+    "日期順序": "urutan tanggal",
 }
 
 
 # ============================================================
-# 6. Chinese polishing
+# 6. Abbreviation normalization
 # ============================================================
 
-chinese_polish_map = {
-    "謝謝你": "謝謝。",
-    "好的": "好。",
-    "是啊姐姐": "好的姐姐。",
-    "ok": "好。"
-}
-
-
-def polish_chinese(text):
-
-    text = text.strip()
-
-    for key, value in chinese_polish_map.items():
-        text = text.replace(key, value)
-
-    if text and not re.search(r'[。！？]$', text):
-        text += "。"
-
-    return text
-
-
-# ============================================================
-# 7. Save Google Sheets
-# ============================================================
-
-def save_to_sheet_row(original, translated, metadata=None):
-
-    if sheet is None:
-        return False
-
-    row = [
-        time.strftime(
-            "%Y-%m-%d %H:%M:%S",
-            time.localtime(time.time() + 8 * 3600)
-        ),
-        original,
-        translated,
-        json.dumps(
-            metadata or {},
-            ensure_ascii=False
-        )
-    ]
-
-    for attempt in range(2):
-
-        try:
-            sheet.append_row(row)
-            return True
-
-        except Exception as e:
-            logger.warning(
-                "Google Sheets write failed: %s",
-                type(e).__name__
-            )
-
-            if attempt == 0:
-                time.sleep(0.5)
-
-    return False
-
-
-# ============================================================
-# 8. Indonesian abbreviation processing
-# ============================================================
-
-# 只展開明確的縮寫，避免把正常印尼文全部替換成中文。
-# 原本完整詞彙表仍保留，用於 AI 翻譯提示。
+# 保留完整原始詞庫，但只正規化明確縮寫。
+# 不再把印尼文直接替換成中文。
 
 indonesian_normalization_map = {
 
@@ -508,6 +453,7 @@ indonesian_normalization_map = {
     "km": "kamu",
     "dy": "dia",
     "dya": "dia",
+    "tmn": "teman",
 
     "bsk": "besok",
     "kmrn": "kemarin",
@@ -516,6 +462,7 @@ indonesian_normalization_map = {
     "blm": "belum",
 
     "mkn": "makan",
+
     "aj": "aja",
     "ajh": "aja",
     "bwt": "buat",
@@ -563,22 +510,27 @@ indonesian_normalization_map = {
     "makasih": "terima kasih",
 
     "rmh": "rumah",
-    "dpn": "depan"
+    "dpn": "depan",
+
+    "ywdh": "ya sudah",
+    "gtw": "tidak tahu",
+    "krg": "kurang",
+    "susa": "susah"
 }
 
 
 def expand_abbreviations(text):
 
     keys = sorted(
-        indonesian_normalization_map,
+        indonesian_normalization_map.keys(),
         key=len,
         reverse=True
     )
 
     pattern = re.compile(
-        r'\b('
-        + '|'.join(re.escape(k) for k in keys)
-        + r')\b',
+        r'(?<!\w)('
+        + "|".join(re.escape(k) for k in keys)
+        + r')(?!\w)',
         flags=re.IGNORECASE
     )
 
@@ -592,40 +544,46 @@ def expand_abbreviations(text):
 
 
 # ============================================================
-# 9. Language detection
+# 7. Language detection
 # ============================================================
 
 def detect_language(text):
 
-    text = text.strip()
+    t = text.strip()
 
-    if not text:
+    if not t:
         return None, text
 
-    if re.search(r'[\u4e00-\u9fff]', text):
+    # 中文優先
+    if re.search(r'[\u4e00-\u9fff]', t):
         return "chinese", text
 
     tokens = re.findall(
         r'[A-Za-z0-9]+',
-        text.lower()
+        t.lower()
     )
 
+    # 印尼文詞庫
     if any(
         token in indonesian_abbreviation_map
+        or token in indonesian_normalization_map
         for token in tokens
     ):
         return "indonesian", text
 
+    # 印尼文常見詞
     if re.search(
-        r'\b(saya|aku|makan|tidur|pagi|selamat|'
-        r'kamu|besok|sudah|belum|nenek)\b',
-        text.lower()
+        r'\b(saya|aku|kamu|nenek|makan|'
+        r'tidur|sudah|belum|besok|pagi|'
+        r'siang|sore|malam|terima|kasih|'
+        r'berapa|kenapa|bagaimana|'
+        r'bisa|tolong|jangan)\b',
+        t.lower()
     ):
         return "indonesian", text
 
     try:
-
-        detected = detect(text).lower()
+        detected = detect(t).lower()
 
         if detected in ("id", "in", "ms"):
             return "indonesian", text
@@ -640,49 +598,68 @@ def detect_language(text):
 
 
 # ============================================================
-# 10. Indonesian time conversion
+# 8. Time conversion
 # ============================================================
 
 def convert_jam_to_hhmm(text):
 
-    def convert_time(match):
+    """
+    Examples:
+
+    jam 9          -> 09:00
+    jam9           -> 09:00
+    jam 9:30       -> 09:30
+    jam 9.30       -> 09:30
+    jam 9.5        -> 09:30
+    jam 3 sore     -> 15:00
+    jam 9 malam    -> 21:00
+
+    不確定的時間不強制轉換。
+    """
+
+    pattern = re.compile(
+        r'(?<!\w)(?:jam|pukul)\s*'
+        r'(\d{1,2})'
+        r'(?:([:.,])(\d{1,2}))?'
+        r'\s*(pagi|siang|sore|malam|am|pm)?'
+        r'(?!\w)',
+        flags=re.IGNORECASE
+    )
+
+    def replace_time(match):
 
         hour = int(match.group(1))
 
-        minute_text = match.group(2)
+        separator = match.group(2)
+        minute_part = match.group(3)
 
         period = (
-            match.group(3) or ""
+            match.group(4) or ""
         ).lower()
+
+        if hour > 23:
+            return match.group(0)
 
         minute = 0
 
-        if minute_text:
+        if minute_part is not None:
 
-            if ":" in minute_text:
-                minute = int(
-                    minute_text.replace(":", "")
-                )
-
-            elif minute_text.startswith("."):
-                value = minute_text[1:]
-
-                if len(value) == 1:
-                    minute = int(
-                        round(float(minute_text) * 60)
-                    )
-                else:
-                    minute = int(value)
+            # jam 9.5 = 9:30
+            if (
+                separator in (".", ",")
+                and len(minute_part) == 1
+            ):
+                minute = int(minute_part) * 6
 
             else:
-                minute = int(minute_text)
+                minute = int(minute_part)
 
-        if hour > 23 or minute > 59:
+        if minute > 59:
             return match.group(0)
 
         if period in ("sore", "malam", "pm"):
 
-            if hour < 12:
+            if 1 <= hour <= 11:
                 hour += 12
 
         elif period in ("pagi", "am"):
@@ -695,17 +672,14 @@ def convert_jam_to_hhmm(text):
             if 1 <= hour <= 6:
                 hour += 12
 
+        # 有上午/下午標記卻使用不合理時間時，
+        # 保留原文避免錯誤轉換。
+        if period and hour > 23:
+            return match.group(0)
+
         return f"{hour:02d}:{minute:02d}"
 
-    pattern = re.compile(
-        r'\b(?:jam|pukul)\s*'
-        r'(\d{1,2})'
-        r'([:.]\d{1,2})?'
-        r'\s*(pagi|siang|sore|malam|am|pm)?\b',
-        flags=re.IGNORECASE
-    )
-
-    return pattern.sub(convert_time, text)
+    return pattern.sub(replace_time, text)
 
 
 def preprocess_text(text, lang):
@@ -720,7 +694,381 @@ def preprocess_text(text, lang):
 
 
 # ============================================================
-# 11. Google Translate fallback
+# 9. Optimized glossary
+# ============================================================
+
+# 完整詞庫保留，但僅傳送相關專有名詞。
+# 一般詞彙交給 AI 理解。
+
+SPECIAL_ID_TERMS = {
+    "ce", "cece", "kak", "bpk",
+    "rehabilitas", "bpjs",
+    "gpp", "gtw", "wkwk"
+}
+
+SPECIAL_ZH_TERMS = {
+    "奶奶",
+    "姐姐",
+    "排便",
+    "復健",
+    "健保卡",
+    "塞劑",
+    "蓮霧",
+    "秋葵",
+    "紅菠菜",
+    "瓦斯爐",
+    "BPJS"
+}
+
+
+def make_glossary(text, source_lang):
+
+    pairs = []
+
+    if source_lang == "Indonesian":
+
+        for key in SPECIAL_ID_TERMS:
+
+            pattern = (
+                r'(?<!\w)'
+                + re.escape(key)
+                + r'(?!\w)'
+            )
+
+            if re.search(
+                pattern,
+                text,
+                flags=re.IGNORECASE
+            ):
+
+                meaning = (
+                    indonesian_abbreviation_map.get(key)
+                )
+
+                if meaning:
+                    pairs.append(
+                        f"{key}: {meaning}"
+                    )
+
+    else:
+
+        for key in SPECIAL_ZH_TERMS:
+
+            if key in text:
+
+                meaning = (
+                    chinese_indonesian_vocab.get(key)
+                )
+
+                if meaning:
+                    pairs.append(
+                        f"{key}: {meaning}"
+                    )
+
+    return "\n".join(sorted(pairs)[:12])
+
+
+# ============================================================
+# 10. Translation cache
+# ============================================================
+
+CACHE_SIZE = int(
+    os.getenv("TRANSLATION_CACHE_SIZE", "2048")
+)
+
+CACHE_TTL = int(
+    os.getenv("TRANSLATION_CACHE_TTL", "86400")
+)
+
+_translation_cache = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def cache_get(key):
+
+    now = time.monotonic()
+
+    with _cache_lock:
+
+        entry = _translation_cache.get(key)
+
+        if entry is None:
+            return None
+
+        value, expires = entry
+
+        if now >= expires:
+            del _translation_cache[key]
+            return None
+
+        _translation_cache.move_to_end(key)
+
+        return value
+
+
+def cache_set(key, value):
+
+    if not value:
+        return
+
+    with _cache_lock:
+
+        _translation_cache[key] = (
+            value,
+            time.monotonic() + CACHE_TTL
+        )
+
+        _translation_cache.move_to_end(key)
+
+        while len(_translation_cache) > CACHE_SIZE:
+            _translation_cache.popitem(last=False)
+
+
+# ============================================================
+# 11. OpenAI configuration
+# ============================================================
+
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-6-luna"
+)
+
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+
+_openai_client = (
+    OpenAI(
+        api_key=OPENAI_KEY,
+        timeout=15.0,
+        max_retries=0
+    )
+    if OPENAI_KEY and OpenAI
+    else None
+)
+
+OPENAI_MAX_COMPLETION_TOKENS = int(
+    os.getenv(
+        "OPENAI_MAX_COMPLETION_TOKENS",
+        "500"
+    )
+)
+
+OPENAI_QUOTA_RECHECK_SECONDS = int(
+    os.getenv(
+        "OPENAI_QUOTA_RECHECK_SECONDS",
+        "3600"
+    )
+)
+
+_openai_unavailable_until = 0.0
+_openai_last_error = None
+_openai_state_lock = threading.Lock()
+
+
+def openai_available():
+
+    if _openai_client is None:
+        return False
+
+    with _openai_state_lock:
+        return (
+            time.monotonic()
+            >= _openai_unavailable_until
+        )
+
+
+def handle_openai_error(error):
+
+    global _openai_unavailable_until
+    global _openai_last_error
+
+    status = getattr(error, "status_code", None)
+
+    body = getattr(error, "body", None)
+
+    code = getattr(error, "code", None)
+
+    if isinstance(body, dict):
+
+        error_data = body.get("error", body)
+
+        if isinstance(error_data, dict):
+            code = code or error_data.get("code")
+
+    error_text = str(error).lower()
+
+    if (
+        code == "insufficient_quota"
+        or "insufficient_quota" in error_text
+        or "exceeded your current quota" in error_text
+    ):
+
+        category = "quota_exhausted"
+
+        logger.error(
+            "OPENAI_CREDIT_EXHAUSTED"
+        )
+
+        with _openai_state_lock:
+            _openai_unavailable_until = (
+                time.monotonic()
+                + OPENAI_QUOTA_RECHECK_SECONDS
+            )
+
+    elif (
+        status == 401
+        or code == "invalid_api_key"
+    ):
+
+        category = "authentication_error"
+
+        logger.error(
+            "OPENAI_AUTHENTICATION_ERROR"
+        )
+
+    elif (
+        code == "model_not_found"
+        or "model_not_found" in error_text
+        or "does not exist" in error_text
+    ):
+
+        category = "model_error"
+
+        logger.error(
+            "OPENAI_MODEL_NOT_AVAILABLE"
+        )
+
+    elif status == 400:
+
+        category = "bad_request"
+
+        logger.error(
+            "OPENAI_BAD_REQUEST"
+        )
+
+    elif status == 429:
+
+        category = "rate_limit"
+
+        logger.warning(
+            "OPENAI_RATE_LIMIT"
+        )
+
+    elif status in (500, 502, 503, 504):
+
+        category = "server_error"
+
+        logger.warning(
+            "OPENAI_SERVER_ERROR"
+        )
+
+    else:
+
+        category = "api_error"
+
+        logger.error(
+            "OPENAI_API_ERROR"
+        )
+
+    with _openai_state_lock:
+        _openai_last_error = category
+
+    # 記錄錯誤原因，但不記錄 API Key 或原始對話。
+    logger.error(
+        "OpenAI detail: status=%s code=%s "
+        "type=%s message=%s",
+        status,
+        code,
+        type(error).__name__,
+        str(error)[:500]
+    )
+
+    return category
+
+
+# ============================================================
+# 12. OpenAI translation
+# ============================================================
+
+def openai_translate(src_lang, tgt_lang, text):
+
+    if not _openai_client:
+        raise RuntimeError(
+            "OpenAI client not configured"
+        )
+
+    glossary = make_glossary(
+        text,
+        src_lang
+    )
+
+    system_prompt = (
+        "You translate Indonesian and Traditional "
+        "Chinese for everyday elderly-care conversations. "
+        "Produce natural, grammatically correct, "
+        "faithful translations. Understand Indonesian "
+        "slang and abbreviations. Preserve names, "
+        "numbers, and existing HH:MM times. "
+        "Keep questions as questions. "
+        "Do not add or remove meaning. "
+        "Use Taiwan Traditional Chinese when translating "
+        "to Chinese. Return only the translation."
+    )
+
+    if glossary:
+
+        system_prompt += (
+            "\nRelevant terminology:\n"
+            + glossary
+        )
+
+    user_prompt = (
+        f"Translate from {src_lang} "
+        f"to {tgt_lang}:\n\n{text}"
+    )
+
+    try:
+
+        response = (
+            _openai_client
+            .chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt
+                    }
+                ],
+                max_completion_tokens=(
+                    OPENAI_MAX_COMPLETION_TOKENS
+                )
+            )
+        )
+
+        translated = (
+            response.choices[0].message.content
+            or ""
+        ).strip()
+
+        if not translated:
+            raise RuntimeError(
+                "OpenAI returned empty translation"
+            )
+
+        return translated
+
+    except Exception as error:
+
+        handle_openai_error(error)
+
+        raise
+
+
+# ============================================================
+# 13. Google Translate fallback
 # ============================================================
 
 translator_id_zh = GoogleTranslator(
@@ -734,10 +1082,9 @@ translator_zh_id = GoogleTranslator(
 )
 
 
-@lru_cache(maxsize=2048)
-def translate_cached(source, target, text):
+def google_translate(source, target, text):
 
-    # 只有成功的翻譯會被快取
+    # Google 只作備援，不快取錯誤訊息。
 
     if source == "id":
 
@@ -764,272 +1111,97 @@ def translate_cached(source, target, text):
 
 
 # ============================================================
-# 12. OpenAI GPT-6 configuration
+# 14. Google Sheets asynchronous logging
 # ============================================================
 
-OPENAI_MODEL = os.getenv(
-    "OPENAI_MODEL",
-    "gpt-6-luna"
-)
-OPENAI_KEY = os.getenv(
-    "OPENAI_API_KEY"
-)
+# 使用單一背景工作執行緒。
+# LINE 回覆不必等待 Google Sheets 寫入完成。
+# 這是盡力寫入，不保證服務重啟前所有資料都完成。
 
-_openai_client = (
-    OpenAI(
-        api_key=OPENAI_KEY,
-        timeout=15.0,
-        max_retries=0
-    )
-    if OPENAI_KEY and OpenAI
-    else None
+_sheet_executor = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="sheet-writer"
 )
 
-# API 額度不足狀態
-OPENAI_QUOTA_EXHAUSTED = False
-
-# 額度不足後暫停 1 小時
-OPENAI_QUOTA_RECHECK_SECONDS = 3600
-
-OPENAI_NEXT_CHECK = 0
+_sheet_pending = threading.BoundedSemaphore(100)
 
 
-def openai_available():
+def save_to_sheet_row(
+    original,
+    translated,
+    metadata=None
+):
 
-    global OPENAI_QUOTA_EXHAUSTED
-    global OPENAI_NEXT_CHECK
-
-    if not _openai_client:
+    if sheet is None:
         return False
 
-    if OPENAI_QUOTA_EXHAUSTED:
+    timestamp = datetime.now(
+        ZoneInfo("Asia/Taipei")
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
-        if time.time() < OPENAI_NEXT_CHECK:
-            return False
-
-        OPENAI_QUOTA_EXHAUSTED = False
-
-        logger.info(
-            "OPENAI_QUOTA_RECHECK"
+    row = [
+        timestamp,
+        original,
+        translated,
+        json.dumps(
+            metadata or {},
+            ensure_ascii=False
         )
+    ]
 
-    return True
-
-
-def handle_openai_error(error):
-
-    global OPENAI_QUOTA_EXHAUSTED
-    global OPENAI_NEXT_CHECK
-
-    error_text = str(error).lower()
-
-    error_code = getattr(
-        error,
-        "code",
-        None
-    )
-
-    if (
-        error_code == "insufficient_quota"
-        or "insufficient_quota" in error_text
-        or "exceeded your current quota" in error_text
-    ):
-
-        OPENAI_QUOTA_EXHAUSTED = True
-
-        OPENAI_NEXT_CHECK = (
-            time.time()
-            + OPENAI_QUOTA_RECHECK_SECONDS
-        )
-
-        logger.error(
-            "OPENAI_CREDIT_EXHAUSTED"
-        )
-
-        return "quota_exhausted"
-
-    if (
-        "invalid_api_key" in error_text
-        or "authentication" in error_text
-    ):
-
-        logger.error(
-            "OPENAI_AUTHENTICATION_ERROR"
-        )
-
-        return "authentication_error"
-
-    if (
-        "model_not_found" in error_text
-        or "does not exist" in error_text
-    ):
-
-        logger.error(
-            "OPENAI_MODEL_NOT_AVAILABLE"
-        )
-
-        return "model_error"
-
-    if "rate_limit" in error_text:
+    if not _sheet_pending.acquire(blocking=False):
 
         logger.warning(
-            "OPENAI_RATE_LIMIT"
+            "GOOGLE_SHEETS_QUEUE_FULL"
         )
 
-        return "rate_limit"
+        return False
 
-    logger.error(
-        "OPENAI_API_ERROR: %s",
-        type(error).__name__
-    )
+    def write_task():
 
-    return "api_error"
+        try:
 
+            for attempt in range(2):
 
-# ============================================================
-# 13. Optimized glossary
-# ============================================================
+                try:
 
-def _make_glossary_pairs(text, src_lang):
+                    sheet.append_row(
+                        row,
+                        value_input_option="RAW"
+                    )
 
-    lines = []
+                    return
 
-    if src_lang == "Indonesian":
+                except Exception as error:
 
-        for key, value in indonesian_abbreviation_map.items():
+                    logger.warning(
+                        "GOOGLE_SHEETS_WRITE_FAILED "
+                        "attempt=%s type=%s",
+                        attempt + 1,
+                        type(error).__name__
+                    )
 
-            pattern = (
-                r'(?<!\w)'
-                + re.escape(key)
-                + r'(?!\w)'
-            )
+                    if attempt == 0:
+                        time.sleep(0.5)
 
-            if re.search(
-                pattern,
-                text,
-                flags=re.IGNORECASE
-            ):
-
-                lines.append(
-                    f"{key} -> {value}"
-                )
-
-    else:
-
-        for key, value in chinese_indonesian_vocab.items():
-
-            if key in text:
-
-                lines.append(
-                    f"{key} -> {value}"
-                )
-
-    return "\n".join(lines[:30])
-
-
-# ============================================================
-# 14. OpenAI translation
-# ============================================================
-
-@lru_cache(maxsize=2048)
-def openai_translate_cached(
-    src_lang,
-    tgt_lang,
-    text
-):
-
-    return openai_translate(
-        src_lang,
-        tgt_lang,
-        text
-    )
-
-
-def openai_translate(
-    src_lang,
-    tgt_lang,
-    text
-):
-
-    if not _openai_client:
-
-        raise RuntimeError(
-            "OpenAI client not configured"
-        )
-
-    glossary_hint = _make_glossary_pairs(
-        text,
-        src_lang
-    )
-
-    system_prompt = (
-        "You are a professional translator between "
-        "Indonesian and Traditional Chinese for "
-        "elderly caregiving conversations.\n"
-        "Translate accurately, naturally and politely.\n"
-        "Understand Indonesian slang and abbreviations.\n"
-        "Preserve names, numbers and HH:MM times.\n"
-        "Do not add explanations.\n"
-        "Return only the translated text."
-    )
-
-    if glossary_hint:
-
-        system_prompt += (
-            "\nRelevant vocabulary:\n"
-            + glossary_hint
-        )
-
-    user_prompt = (
-        f"Translate from {src_lang} "
-        f"to {tgt_lang}:\n"
-        f"{text}"
-    )
+        finally:
+            _sheet_pending.release()
 
     try:
 
-        response = (
-            _openai_client
-            .chat.completions.create(
+        _sheet_executor.submit(write_task)
 
-                model=OPENAI_MODEL,
+        return True
 
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt
-                    }
-                ],
+    except RuntimeError:
 
-                max_completion_tokens=300
-            )
-        )
+        _sheet_pending.release()
 
-        translated = (
-            response.choices[0].message.content or ""
-        ).strip()
-
-        if not translated:
-
-            raise RuntimeError(
-                "Empty translation from OpenAI"
-            )
-
-        return translated
-
-    except Exception as e:
-
-        handle_openai_error(e)
-
-        raise
+        return False
 
 
 # ============================================================
-# 15. Rate limiter
+# 15. Rate limiting
 # ============================================================
 
 RATE_LIMIT = int(
@@ -1040,33 +1212,44 @@ RATE_LIMIT = int(
 )
 
 _rate_store = {}
+_rate_lock = threading.Lock()
 
 
 def rate_limited(key):
 
-    now = int(time.time())
+    now = time.monotonic()
 
-    record = _rate_store.get(
-        key,
-        [0, now]
-    )
+    with _rate_lock:
 
-    count, start = record
+        count, start = _rate_store.get(
+            key,
+            (0, now)
+        )
 
-    if now - start >= 60:
+        if now - start >= 60:
+            count = 0
+            start = now
 
-        record = [0, now]
+        if count >= RATE_LIMIT:
+            return True
 
-        count = 0
+        _rate_store[key] = (
+            count + 1,
+            start
+        )
 
-    if count >= RATE_LIMIT:
-        return True
+        # 定期清除過期紀錄
+        if len(_rate_store) > 5000:
 
-    record[0] += 1
+            expired = [
+                k for k, (_, s) in _rate_store.items()
+                if now - s >= 120
+            ]
 
-    _rate_store[key] = record
+            for k in expired:
+                _rate_store.pop(k, None)
 
-    return False
+        return False
 
 
 # ============================================================
@@ -1078,16 +1261,22 @@ def process_message(
     client_key="anonymous"
 ):
 
+    if not isinstance(text, str):
+        return {"error": "請輸入有效文字"}
+
     text = text.strip()
 
     if not text:
+        return {"error": "請輸入有效文字"}
 
+    if len(text) > MAX_TEXT_LENGTH:
         return {
-            "error": "請輸入有效文字"
+            "error": (
+                f"文字過長，最多 {MAX_TEXT_LENGTH} 字"
+            )
         }
 
     if rate_limited(client_key):
-
         return {
             "error": (
                 f"速率限制：每 60 秒最多 "
@@ -1098,52 +1287,43 @@ def process_message(
     lang, cleaned = detect_language(text)
 
     if not lang:
-
-        return {
-            "error": "無法偵測語言"
-        }
+        return {"error": "無法偵測語言"}
 
     lang = str(lang).lower()
 
-    # 印尼文 -> 中文
+    # Indonesian -> Traditional Chinese
     if (
         lang == "indonesian"
         or lang.startswith("id")
     ):
 
-        expanded = expand_abbreviations(
-            cleaned
-        )
+        expanded = expand_abbreviations(cleaned)
 
         pre = preprocess_text(
             expanded,
             "indonesian"
         )
 
-        source = "Indonesian"
-
-        target = "Traditional Chinese"
+        src_lang = "Indonesian"
+        tgt_lang = "Traditional Chinese"
 
         google_source = "id"
-
         google_target = "zh-TW"
 
         direction = "id->zh"
 
-    # 中文 -> 印尼文
+    # Traditional Chinese -> Indonesian
     elif (
         lang == "chinese"
         or lang.startswith("zh")
     ):
 
-        pre = polish_chinese(cleaned)
+        pre = cleaned
 
-        source = "Traditional Chinese"
-
-        target = "Indonesian"
+        src_lang = "Traditional Chinese"
+        tgt_lang = "Indonesian"
 
         google_source = "zh-TW"
-
         google_target = "id"
 
         direction = "zh->id"
@@ -1154,79 +1334,105 @@ def process_message(
             "error": "僅支援中文與印尼文"
         }
 
-    result = None
+    # 依模型、翻譯方向、文字區分快取
+    cache_key = (
+        OPENAI_MODEL,
+        direction,
+        pre
+    )
 
-    meta = {}
+    cached = cache_get(cache_key)
 
-    # 優先使用 OpenAI
-    if openai_available():
+    if cached is not None:
 
-        try:
+        result = cached
 
-            result = openai_translate_cached(
-                source,
-                target,
-                pre
-            )
+        meta = {
+            "source": "cache",
+            "model": OPENAI_MODEL
+        }
 
-            meta = {
-                "source": "openai",
-                "model": OPENAI_MODEL
-            }
+        logger.info(
+            "TRANSLATION_CACHE_HIT"
+        )
 
-            logger.info(
-                "OPENAI_TRANSLATION_SUCCESS"
-            )
+    else:
 
-        except Exception as e:
+        result = None
+        meta = {}
 
-            logger.warning(
-                "OpenAI translation failed, "
-                "switching to Google: %s",
-                type(e).__name__
-            )
+        # First: OpenAI
+        if openai_available():
 
-    # OpenAI 失敗 -> Google
-    if not result:
+            try:
 
-        try:
+                result = openai_translate(
+                    src_lang,
+                    tgt_lang,
+                    pre
+                )
 
-            result = translate_cached(
-                google_source,
-                google_target,
-                pre
-            )
-
-            meta = {
-                "source": "google-fallback"
-            }
-
-            logger.info(
-                "GOOGLE_FALLBACK_SUCCESS"
-            )
-
-        except Exception as e:
-
-            logger.error(
-                "GOOGLE_FALLBACK_FAILED: %s",
-                type(e).__name__
-            )
-
-            return {
-                "error": (
-                    "翻譯服務暫時無法使用，"
-                    "請稍後再試。"
-                ),
-                "meta": {
-                    "source": "unavailable",
-                    "openai_quota_exhausted":
-                        OPENAI_QUOTA_EXHAUSTED
+                meta = {
+                    "source": "openai",
+                    "model": OPENAI_MODEL
                 }
-            }
 
-    if direction == "id->zh":
+                cache_set(
+                    cache_key,
+                    result
+                )
 
-        result = polish_chinese(result)
+                logger.info(
+                    "OPENAI_TRANSLATION_SUCCESS"
+                )
+
+            except Exception as error:
+
+                logger.warning(
+                    "OpenAI failed; trying Google: %s",
+                    type(error).__name__
+                )
+
+        # Second: Google fallback
+        if not result:
+
+            try:
+
+                result = google_translate(
+                    google_source,
+                    google_target,
+                    pre
+                )
+
+                meta = {
+                    "source": "google-fallback"
+                }
+
+                # Google 備援結果不放入 OpenAI 快取，
+                # 避免恢復額度後一直沿用備援翻譯。
+                logger.info(
+                    "GOOGLE_FALLBACK_SUCCESS"
+                )
+
+            except Exception as error:
+
+                logger.error(
+                    "GOOGLE_FALLBACK_FAILED: %s",
+                    type(error).__name__
+                )
+
+                return {
+                    "error": (
+                        "翻譯服務暫時無法使用，"
+                        "請稍後再試。"
+                    ),
+                    "meta": {
+                        "source": "unavailable"
+                    }
+                }
+
+    # 不再強制改寫中文或補句號。
+    # 直接保留翻譯引擎的自然句子。
 
     save_to_sheet_row(
         text,
@@ -1251,7 +1457,7 @@ def process_message(
     if direction == "id->zh":
 
         response["original_expanded"] = (
-            expand_abbreviations(cleaned)
+            expanded
         )
 
         response["preprocessed"] = pre
@@ -1267,6 +1473,12 @@ def process_message(
 # 17. Flask endpoints
 # ============================================================
 
+@app.route("/", methods=["GET", "HEAD"])
+def home():
+
+    return "LINE Translator is running", 200
+
+
 @app.route("/ping", methods=["GET", "HEAD"])
 def ping():
 
@@ -1276,13 +1488,24 @@ def ping():
 @app.route("/health", methods=["GET"])
 def health():
 
+    with _openai_state_lock:
+
+        available_after = (
+            _openai_unavailable_until
+        )
+
+        last_error = _openai_last_error
+
     return jsonify({
         "ok": True,
         "sheets": sheet is not None,
         "openai": _openai_client is not None,
         "model": OPENAI_MODEL,
-        "openai_quota_exhausted":
-            OPENAI_QUOTA_EXHAUSTED
+        "openai_available": (
+            _openai_client is not None
+            and time.monotonic() >= available_after
+        ),
+        "openai_last_error": last_error
     }), 200
 
 
@@ -1305,18 +1528,13 @@ def api_authorized():
         ""
     )
 
-    import hmac
-
     return hmac.compare_digest(
         supplied,
         TRANSLATE_API_KEY
     )
 
 
-@app.route(
-    "/translate",
-    methods=["POST"]
-)
+@app.route("/translate", methods=["POST"])
 def translate_api():
 
     if not api_authorized():
@@ -1327,12 +1545,15 @@ def translate_api():
 
     data = request.get_json(
         silent=True
-    ) or {}
-
-    text = data.get(
-        "text",
-        ""
     )
+
+    if not isinstance(data, dict):
+
+        return jsonify({
+            "error": "Invalid JSON"
+        }), 400
+
+    text = data.get("text", "")
 
     if not isinstance(text, str):
 
@@ -1340,7 +1561,10 @@ def translate_api():
             "error": "Invalid text"
         }), 400
 
-    client = request.remote_addr or "anonymous"
+    client = (
+        request.remote_addr
+        or "anonymous"
+    )
 
     result = process_message(
         text,
@@ -1348,16 +1572,11 @@ def translate_api():
     )
 
     return jsonify(result), (
-        200
-        if "result" in result
-        else 400
+        200 if "result" in result else 400
     )
 
 
-@app.route(
-    "/history",
-    methods=["GET"]
-)
+@app.route("/history", methods=["GET"])
 def history():
 
     if not api_authorized():
@@ -1375,28 +1594,21 @@ def history():
     try:
 
         n = int(
-            request.args.get(
-                "n",
-                20
-            )
+            request.args.get("n", 20)
         )
 
-        n = max(
-            1,
-            min(n, 100)
-        )
+        n = max(1, min(n, 100))
 
-        rows = sheet.get_all_values()[-n:]
+        rows = sheet.get_all_values()
 
         return jsonify({
-            "rows": rows
+            "rows": rows[-n:]
         }), 200
 
-    except Exception as e:
+    except Exception:
 
         logger.exception(
-            "History error: %s",
-            e
+            "Google Sheets history failed"
         )
 
         return jsonify({
@@ -1405,14 +1617,15 @@ def history():
 
 
 # ============================================================
-# 19. LINE Webhook
+# 19. LINE webhook
 # ============================================================
 
-@app.route(
-    "/callback",
-    methods=["POST"]
-)
+@app.route("/callback", methods=["POST"])
 def callback():
+
+    if not handler or not line_bot_api:
+
+        return "LINE not configured", 503
 
     signature = request.headers.get(
         "X-Line-Signature",
@@ -1423,10 +1636,6 @@ def callback():
         as_text=True
     )
 
-    if not handler or not line_bot_api:
-
-        return "LINE not configured", 503
-
     try:
 
         handler.handle(
@@ -1434,14 +1643,21 @@ def callback():
             signature
         )
 
-    except Exception as e:
+    except InvalidSignatureError:
 
-        logger.exception(
-            "LINE webhook error: %s",
-            e
+        logger.warning(
+            "LINE_INVALID_SIGNATURE"
         )
 
-        return "Webhook error", 400
+        return "Invalid signature", 400
+
+    except Exception:
+
+        logger.exception(
+            "LINE_WEBHOOK_ERROR"
+        )
+
+        return "Webhook error", 500
 
     return "OK", 200
 
@@ -1476,7 +1692,9 @@ if handler:
                 or "unknown"
             )
 
-            client_key = f"line:{user_id}"
+            client_key = (
+                f"line:{user_id}"
+            )
 
             result = process_message(
                 user_msg,
@@ -1485,10 +1703,8 @@ if handler:
 
             if "result" in result:
 
-                reply_text = (
-                    "🗣️ 翻譯結果："
-                    + result["result"]
-                )
+                # 不再顯示「🗣️ 翻譯結果：」
+                reply_text = result["result"]
 
             else:
 
@@ -1503,28 +1719,18 @@ if handler:
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(
-                    text=reply_text
+                    text=reply_text[:5000]
                 )
             )
 
-        except Exception as e:
+        except Exception:
 
             logger.exception(
-                "LINE message error: %s",
-                e
+                "LINE_MESSAGE_ERROR"
             )
 
-            try:
-
-                line_bot_api.reply_message(
-                    event.reply_token,
-                    TextSendMessage(
-                        text="⚠️ 內部錯誤，請稍後再試。"
-                    )
-                )
-
-            except Exception:
-                pass
+            # 避免重複使用已消耗的 reply token。
+            raise
 
 
 # ============================================================
@@ -1534,10 +1740,7 @@ if handler:
 if __name__ == "__main__":
 
     port = int(
-        os.getenv(
-            "PORT",
-            5000
-        )
+        os.getenv("PORT", "5000")
     )
 
     host = os.getenv(
@@ -1563,9 +1766,6 @@ if __name__ == "__main__":
         host=host,
         port=port,
         debug=(
-            os.getenv(
-                "FLASK_DEBUG",
-                "0"
-            ) == "1"
+            os.getenv("FLASK_DEBUG", "0") == "1"
         )
     )
