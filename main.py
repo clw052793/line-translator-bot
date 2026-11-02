@@ -769,9 +769,8 @@ def translate_cached(source, target, text):
 
 OPENAI_MODEL = os.getenv(
     "OPENAI_MODEL",
-    "gpt-6"
+    "gpt-6-luna"
 )
-
 OPENAI_KEY = os.getenv(
     "OPENAI_API_KEY"
 )
